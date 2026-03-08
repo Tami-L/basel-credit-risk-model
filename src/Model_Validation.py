@@ -13,8 +13,7 @@ from sklearn.metrics import (
     roc_curve, 
     roc_auc_score,
     confusion_matrix,
-    accuracy_score,
-    classification_report
+    accuracy_score
 )
 from scipy.stats import ks_2samp
 
@@ -22,21 +21,27 @@ from scipy.stats import ks_2samp
 sns.set()
 
 # =============================================================================
-# Load Test Data
+# Load Model and Test Data
 # =============================================================================
 
+# Load the model
+with open('/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/pd_model.sav', 'rb') as file:
+    reg2 = pickle.load(file)
+
+print("Model loaded successfully")
+
 # Load test datasets
-loan_data_inputs_test = pd.read_csv('/Users/lindokuhletami/Desktop/Space/data/loan_data_inputs_test.csv')
-loan_data_targets_test = pd.read_csv('/Users/lindokuhletami/Desktop/Space/data/loan_data_targets_test.csv')
+loan_data_inputs_test = pd.read_csv("/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/data/loan_data_inputs_test.csv")
+loan_data_targets_test = pd.read_csv('/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/data/loan_data_targets_test.csv')
 
 print(f"Inputs test shape: {loan_data_inputs_test.shape}")
 print(f"Targets test shape: {loan_data_targets_test.shape}")
 
 # =============================================================================
-# Select Features (as per the original notebook)
+# Select Features
 # =============================================================================
 
-# Select all the feature columns (excluding reference categories)
+# Select all feature columns
 inputs_test_with_ref_cat = loan_data_inputs_test.loc[: , [
     'grade:A', 'grade:B', 'grade:C', 'grade:D', 'grade:E', 'grade:F', 'grade:G',
     'home_ownership:RENT_OTHER_NONE_ANY', 'home_ownership:OWN', 'home_ownership:MORTGAGE',
@@ -76,10 +81,8 @@ inputs_test_with_ref_cat = loan_data_inputs_test.loc[: , [
     'mths_since_last_record:32-80', 'mths_since_last_record:81-86', 'mths_since_last_record:>=86'
 ]]
 
-# Define reference categories to drop
+# Define reference categories to drop (excluding grade:G and home_ownership:RENT_OTHER_NONE_ANY)
 ref_categories = [
-    'grade:G',
-    'home_ownership:RENT_OTHER_NONE_ANY',
     'addr_state:ND_NE_IA_NV_FL_HI_AL',
     'verification_status:Verified',
     'purpose:educ__sm_b__wedd__ren_en__mov__house',
@@ -97,70 +100,30 @@ ref_categories = [
     'mths_since_last_record:0-2'
 ]
 
-# Drop reference categories to get final test features
+# Drop reference categories
 inputs_test = inputs_test_with_ref_cat.drop(ref_categories, axis=1)
 print(f"Final test features shape: {inputs_test.shape}")
-print(f"Number of features: {inputs_test.shape[1]}")
-
-
-from sklearn import linear_model
-import scipy.stats as stat
-import numpy as np
-
-class LogisticRegression_with_p_values:
-
-    def __init__(self,*args,**kwargs):
-        self.model = linear_model.LogisticRegression(*args,**kwargs)
-
-    def fit(self,X,y):
-        self.model.fit(X,y)
-
-        denom = (2.0*(1.0+np.cosh(self.model.decision_function(X))))
-        denom = np.tile(denom,(X.shape[1],1)).T
-        F_ij = np.dot((X/denom).T,X)
-        Cramer_Rao = np.linalg.inv(F_ij)
-        sigma_estimates = np.sqrt(np.diagonal(Cramer_Rao))
-
-        z_scores = self.model.coef_[0]/sigma_estimates
-        p_values = [stat.norm.sf(abs(x))*2 for x in z_scores]
-
-        self.p_values = p_values
-
-# =============================================================================
-# Load Saved Model
-# =============================================================================
-
-# Load the model using pickle (adjust filename/path as needed)
-with open('/Users/lindokuhletami/Desktop/Space/src/pd_model.sav', 'rb') as file:
-    reg2 = pickle.load(file)
-
-print("Model loaded successfully")
 
 # =============================================================================
 # Generate Predictions
 # =============================================================================
 
 # Generate class predictions
-y_hat_test = reg2.model.predict(inputs_test)
+y_hat_test = reg2.predict(inputs_test)
 print(f"Class predictions shape: {y_hat_test.shape}")
 
 # Generate probability predictions
-y_hat_test_proba = reg2.model.predict_proba(inputs_test)
+y_hat_test_proba = reg2.predict_proba(inputs_test)
+y_hat_test_proba = y_hat_test_proba[:, 1]  # Probabilities for class 1 (bad loans)
 print(f"Probability predictions shape: {y_hat_test_proba.shape}")
-
-# Extract probabilities for class 1 (bad loans)
-y_hat_test_proba = y_hat_test_proba[:, 1]
-print(f"Probability for class 1 shape: {y_hat_test_proba.shape}")
 
 # =============================================================================
 # Create DataFrame with Actual and Predicted Values
 # =============================================================================
 
-# Prepare targets DataFrame
 loan_data_targets_test_temp = loan_data_targets_test.copy()
 loan_data_targets_test_temp.reset_index(drop=True, inplace=True)
 
-# Combine actual and predicted probabilities
 df_actual_predicted_probs = pd.concat([
     loan_data_targets_test_temp, 
     pd.DataFrame(y_hat_test_proba)
@@ -170,19 +133,17 @@ df_actual_predicted_probs.columns = ['loan_data_targets_test', 'y_hat_test_proba
 df_actual_predicted_probs.index = loan_data_inputs_test.index
 
 print(f"\nActual vs Predicted DataFrame shape: {df_actual_predicted_probs.shape}")
-print(df_actual_predicted_probs.head())
 
 # =============================================================================
 # Accuracy Metrics with Threshold
 # =============================================================================
 
-# Apply threshold for classification
 tr = 0.9
 df_actual_predicted_probs['y_hat_test'] = np.where(
     df_actual_predicted_probs['y_hat_test_proba'] > tr, 1, 0
 )
 
-# Confusion matrix - using sklearn
+# Confusion matrix
 cm = confusion_matrix(
     df_actual_predicted_probs['loan_data_targets_test'], 
     df_actual_predicted_probs['y_hat_test']
@@ -190,7 +151,7 @@ cm = confusion_matrix(
 print(f"\nConfusion Matrix (threshold={tr}):")
 print(cm)
 
-# Normalized confusion matrix - using sklearn with normalize parameter
+# Normalized confusion matrix
 cm_norm = confusion_matrix(
     df_actual_predicted_probs['loan_data_targets_test'], 
     df_actual_predicted_probs['y_hat_test'],
@@ -199,7 +160,7 @@ cm_norm = confusion_matrix(
 print(f"\nNormalized Confusion Matrix (threshold={tr}):")
 print(cm_norm)
 
-# Calculate accuracy - using sklearn
+# Accuracy
 accuracy = accuracy_score(
     df_actual_predicted_probs['loan_data_targets_test'], 
     df_actual_predicted_probs['y_hat_test']
@@ -210,7 +171,6 @@ print(f"\nAccuracy (threshold={tr}): {accuracy:.4f}")
 # ROC Curve and AUROC
 # =============================================================================
 
-# Calculate ROC curve
 fpr, tpr, thresholds = roc_curve(
     df_actual_predicted_probs['loan_data_targets_test'],
     df_actual_predicted_probs['y_hat_test_proba']
@@ -231,13 +191,12 @@ AUROC = roc_auc_score(
     df_actual_predicted_probs['loan_data_targets_test'], 
     df_actual_predicted_probs['y_hat_test_proba']
 )
-print(f"\nAUROC: {AUROC:.4f}")
+print(f"AUROC: {AUROC:.4f}")
 
 # =============================================================================
 # Gini Coefficient
 # =============================================================================
 
-# Calculate Gini coefficient from AUROC (this is already a simple formula)
 Gini = AUROC * 2 - 1
 print(f"Gini Coefficient: {Gini:.4f}")
 
@@ -245,14 +204,13 @@ print(f"Gini Coefficient: {Gini:.4f}")
 # Kolmogorov-Smirnov (KS) Statistic
 # =============================================================================
 
-# Calculate KS statistic using scipy
 good_probs = df_actual_predicted_probs[df_actual_predicted_probs['loan_data_targets_test'] == 0]['y_hat_test_proba']
 bad_probs = df_actual_predicted_probs[df_actual_predicted_probs['loan_data_targets_test'] == 1]['y_hat_test_proba']
 
 ks_statistic, ks_pvalue = ks_2samp(good_probs, bad_probs)
-print(f"\nKS Statistic: {ks_statistic:.4f}")
+print(f"KS Statistic: {ks_statistic:.4f}")
 
-# For the KS chart, we need to recalculate cumulative percentages
+# KS chart
 df_sorted = df_actual_predicted_probs.sort_values('y_hat_test_proba').reset_index(drop=True)
 total_pop = df_sorted.shape[0]
 total_good = (df_sorted['loan_data_targets_test'] == 0).sum()
@@ -261,22 +219,9 @@ total_bad = (df_sorted['loan_data_targets_test'] == 1).sum()
 df_sorted['Cumulative Perc Good'] = (df_sorted['loan_data_targets_test'] == 0).cumsum() / total_good
 df_sorted['Cumulative Perc Bad'] = (df_sorted['loan_data_targets_test'] == 1).cumsum() / total_bad
 
-# Plot KS chart
 plt.figure(figsize=(10, 6))
-plt.plot(
-    df_sorted['y_hat_test_proba'], 
-    df_sorted['Cumulative Perc Bad'], 
-    color='r', 
-    linewidth=2, 
-    label='Bad'
-)
-plt.plot(
-    df_sorted['y_hat_test_proba'], 
-    df_sorted['Cumulative Perc Good'], 
-    color='b', 
-    linewidth=2, 
-    label='Good'
-)
+plt.plot(df_sorted['y_hat_test_proba'], df_sorted['Cumulative Perc Bad'], color='r', linewidth=2, label='Bad')
+plt.plot(df_sorted['y_hat_test_proba'], df_sorted['Cumulative Perc Good'], color='b', linewidth=2, label='Good')
 plt.xlabel('Estimated Probability for being Good')
 plt.ylabel('Cumulative %')
 plt.title('Kolmogorov-Smirnov Chart')

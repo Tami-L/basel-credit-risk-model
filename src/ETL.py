@@ -330,7 +330,7 @@ def save_outputs(X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame
 
 
 if __name__ == "__main__":
-    src = Path(__file__).parents[1] / "data" / "loan_data_2007_2014(1).csv"
+    src = '/Users/lindokuhletami/Desktop/Space/data/loan_data_2007_2014(1).csv'
     df = load_data(str(src))
     X_train, y_train, X_test, y_test = split_and_prepare(df)
     save_outputs(X_train, y_train, X_test, y_test, str(Path(__file__).parents[1] / "data"))

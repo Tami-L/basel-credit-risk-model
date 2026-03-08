@@ -125,7 +125,7 @@ def get_risk_tier(score):
 # LOAD MODEL
 # =====================================================
 
-model_path = "/Users/lindokuhletami/Desktop/Space/src/pd_model.sav"
+model_path = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/pd_model.sav"
 
 with open(model_path, "rb") as file:
     model = pickle.load(file)
@@ -138,7 +138,7 @@ print("Model type:", type(model))
 # LOAD DATA
 # =====================================================
 
-data_path = "/Users/lindokuhletami/Desktop/Space/data/loan_data_inputs_train.csv"
+data_path = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/data/loan_data_inputs_train.csv"
 
 
 X_test = pd.read_csv(data_path)
