@@ -25,7 +25,7 @@ class LogisticRegression_with_p_values:
         self.p_values = p_values
 
 # =====================================================
-# SCORECARD FUNCTIONS
+# SCORECARD FUNCTIONS - DEFINED FIRST
 # =====================================================
 
 def build_scorecard(model, feature_names, 
@@ -74,7 +74,16 @@ def build_scorecard(model, feature_names,
 def calculate_credit_score(X, scorecard, base_points_raw, 
                           min_score=300, max_score=850,
                           scaling_factor=1.0):
+    """
+    Calculate credit scores from features and scorecard
     
+    Parameters:
+    - X: DataFrame with features
+    - scorecard: DataFrame with feature points
+    - base_points_raw: Raw base points from intercept
+    - min_score: Minimum credit score (default 300)
+    - max_score: Maximum credit score (default 850)
+    """
     
     # Calculate raw scores
     raw_scores = np.zeros(len(X))
@@ -90,18 +99,15 @@ def calculate_credit_score(X, scorecard, base_points_raw,
     
     # Scale to desired range using min-max scaling
     if raw_scores.min() != raw_scores.max():
-        
         scaled_scores = min_score + (raw_scores - raw_scores.min()) * (max_score - min_score) / (raw_scores.max() - raw_scores.min())
-        
-        
-        # scaled_scores = base_score + (raw_scores - raw_scores.mean()) * (max_score - min_score) / (raw_scores.max() - raw_scores.min())
     else:
-        scaled_scores = np.full_like(raw_scores, base_score)
+        # If all scores are the same, use the midpoint
+        scaled_scores = np.full_like(raw_scores, (min_score + max_score) // 2)
     
-   
+    # Clip to ensure within bounds
     scaled_scores = np.clip(scaled_scores, min_score, max_score)
     
-    
+    # Round to integers
     scaled_scores = np.round(scaled_scores).astype(int)
     
     return scaled_scores
@@ -122,7 +128,7 @@ def get_risk_tier(score):
 
 
 # =====================================================
-# LOAD MODEL
+# LOAD MODEL - CODE STARTS HERE
 # =====================================================
 
 model_path = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/pd_model.sav"
@@ -335,7 +341,7 @@ scores = calculate_credit_score(
 print("\nFirst 10 Scaled Scores (South African scale):")
 print(scores[:10])
 
-# Add risk tiers
+# Add risk tiers - NOW THIS WORKS because get_risk_tier is defined above
 risk_tiers = [get_risk_tier(score) for score in scores]
 
 
