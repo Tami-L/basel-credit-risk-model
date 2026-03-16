@@ -442,12 +442,38 @@ def split_and_prepare(
     return X_train_prep, y_train_prep, X_test_prep, y_test_prep
 
 
+def compute_ead(df_raw: pd.DataFrame) -> pd.Series:
+    """
+    Compute Exposure at Default (EAD) as outstanding balance.
+
+    EAD = funded_amnt - total_pymnt, floored at 0.
+    A negative value would mean the borrower has overpaid (edge case),
+    so we clip to 0.
+
+    Parameters
+    ----------
+    df_raw : raw loan DataFrame containing funded_amnt and total_pymnt
+
+    Returns
+    -------
+    pd.Series of EAD values, indexed to match df_raw
+    """
+    if "funded_amnt" not in df_raw.columns or "total_pymnt" not in df_raw.columns:
+        raise ValueError(
+            "Raw data must contain 'funded_amnt' and 'total_pymnt' to compute EAD."
+        )
+    ead = (df_raw["funded_amnt"] - df_raw["total_pymnt"]).clip(lower=0)
+    return ead.rename("ead")
+
+
 def save_outputs(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_test: pd.DataFrame,
     y_test: pd.Series,
     out_dir: str,
+    ead_train: Optional[pd.Series] = None,
+    ead_test: Optional[pd.Series] = None,
 ):
     p = Path(out_dir)
     p.mkdir(parents=True, exist_ok=True)
@@ -455,10 +481,33 @@ def save_outputs(
     y_train.to_csv(p / "loan_data_targets_train.csv", index=False)
     X_test.to_csv(p / "loan_data_inputs_test.csv", index=False)
     y_test.to_csv(p / "loan_data_targets_test.csv", index=False)
+    if ead_train is not None:
+        ead_train.to_csv(p / "ead_train.csv", index=False)
+        print(f"EAD train saved: {len(ead_train)} rows")
+    if ead_test is not None:
+        ead_test.to_csv(p / "ead_test.csv", index=False)
+        print(f"EAD test  saved: {len(ead_test)} rows")
 
 
 if __name__ == "__main__":
     src = '/Users/lindokuhletami/Desktop/Space/data/loan_data_2007_2014(1).csv'
     df = load_data(str(src))
+
+    # Compute EAD from the raw data BEFORE the train/test split so that
+    # the index alignment is preserved. We then split EAD in sync with
+    # the feature split using the same random_state.
+    from sklearn.model_selection import train_test_split as _tts
+    ead_full = compute_ead(df)
+
     X_train, y_train, X_test, y_test = split_and_prepare(df)
-    save_outputs(X_train, y_train, X_test, y_test, str(Path(__file__).parents[1] / "data"))
+
+    # Re-split EAD using the same indices produced by split_and_prepare
+    ead_train = ead_full.loc[X_train.index].reset_index(drop=True)
+    ead_test  = ead_full.loc[X_test.index].reset_index(drop=True)
+
+    out = str(Path(__file__).parents[1] / "data")
+    save_outputs(X_train, y_train, X_test, y_test, out,
+                 ead_train=ead_train, ead_test=ead_test)
+
+    print(f"\nEAD stats (train):")
+    print(ead_train.describe())
