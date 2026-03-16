@@ -7,6 +7,7 @@ then builds and calculates a South-African-scaled credit scorecard.
 """
 
 import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,21 +16,16 @@ from sklearn import linear_model
 
 
 # ---------------------------------------------------------------------------
-# Paths — update these to match your environment
+# Paths — relative to this file so they work on any machine / Streamlit Cloud
 # ---------------------------------------------------------------------------
-
-from pathlib import Path
-
 SRC_DIR   = Path(__file__).resolve().parent   # .../src/
 ROOT_DIR  = SRC_DIR.parent                    # .../basel-credit-risk-model/
 DATA_DIR  = ROOT_DIR / "data"
 MODEL_DIR = SRC_DIR
 
-DATA_PATH          = f"{DATA_DIR}/loan_data_inputs_train.csv"
-MODEL_SAVE_PATH    = f"{MODEL_DIR}/pd_model.sav"
-# Feature list saved by train_pd_model.py — contains only the columns
-# that survived the p-value filter, in the exact order the model expects
-FEATURES_SAVE_PATH = f"{MODEL_DIR}/pd_model_features.pkl"
+DATA_PATH          = DATA_DIR  / "loan_data_inputs_train.csv"
+MODEL_SAVE_PATH    = MODEL_DIR / "pd_model.sav"
+FEATURES_SAVE_PATH = MODEL_DIR / "pd_model_features.pkl"
 
 # South African credit score scale parameters
 ZA_MIN_SCORE  = 300
@@ -40,11 +36,10 @@ ZA_PDO        = 50
 
 
 # ---------------------------------------------------------------------------
-# Scorecard functions
+# Scorecard functions — available at import time (used by app.py)
 # ---------------------------------------------------------------------------
 
-def build_scorecard(model, feature_names,
-                    pdo=50, base_score=600, base_odds=50):
+def build_scorecard(model, feature_names, pdo=50, base_score=600, base_odds=50):
     """
     Build a scorecard using the PDO (Points to Double Odds) scaling method.
 
@@ -95,8 +90,7 @@ def build_scorecard(model, feature_names,
     return scorecard, base_points_raw
 
 
-def calculate_credit_score(X, scorecard, base_points_raw,
-                            min_score=300, max_score=850):
+def calculate_credit_score(X, scorecard, base_points_raw, min_score=300, max_score=850):
     """
     Calculate min-max scaled credit scores from a feature matrix.
 
@@ -124,7 +118,6 @@ def calculate_credit_score(X, scorecard, base_points_raw,
           f"Max: {raw_scores.max():.2f}, "
           f"Mean: {raw_scores.mean():.2f}")
 
-    # Min-max scale to [min_score, max_score]
     r_min, r_max = raw_scores.min(), raw_scores.max()
     if r_min != r_max:
         scaled = min_score + (raw_scores - r_min) * (max_score - min_score) / (r_max - r_min)
@@ -149,91 +142,69 @@ def get_risk_tier(score):
 
 
 # ---------------------------------------------------------------------------
-# 1. Load model and feature list
+# Standalone execution only — nothing below here runs when app.py imports
+# this file. Only the three functions above are exposed at import time.
 # ---------------------------------------------------------------------------
-print("Loading model and feature list...")
+if __name__ == "__main__":
 
-with open(MODEL_SAVE_PATH, "rb") as f:
-    model = pickle.load(f)
+    # 1. Load model and feature list
+    print("Loading model and feature list...")
+    with open(MODEL_SAVE_PATH, "rb") as f:
+        model = pickle.load(f)
+    with open(FEATURES_SAVE_PATH, "rb") as f:
+        significant_features = pickle.load(f)
+    print(f"Model loaded:    {type(model)}")
+    print(f"Features loaded: {len(significant_features)} significant features")
 
-with open(FEATURES_SAVE_PATH, "rb") as f:
-    significant_features = pickle.load(f)
+    # 2. Load data and apply the saved feature selection
+    print("\nLoading data...")
+    X = pd.read_csv(DATA_PATH)
+    print(f"Raw data shape: {X.shape}")
 
-print(f"Model loaded:    {type(model)}")
-print(f"Features loaded: {len(significant_features)} significant features")
+    missing = [c for c in significant_features if c not in X.columns]
+    if missing:
+        raise ValueError(
+            f"The following significant features are missing from the data:\n{missing}"
+        )
 
+    X = X[significant_features].copy()
+    print(f"Filtered shape (significant features only): {X.shape}")
 
-# ---------------------------------------------------------------------------
-# 2. Load data and apply the saved feature selection
-#    — uses exactly the columns that survived the p-value filter,
-#      in the exact order the model expects. No manual column lists needed.
-# ---------------------------------------------------------------------------
-print("\nLoading data...")
-X = pd.read_csv(DATA_PATH)
-print(f"Raw data shape: {X.shape}")
-
-missing = [c for c in significant_features if c not in X.columns]
-if missing:
-    raise ValueError(
-        f"The following significant features are missing from the data:\n{missing}"
+    # 3. Build scorecard
+    print("\nBuilding scorecard...")
+    scorecard, base_points_raw = build_scorecard(
+        model,
+        feature_names=significant_features,
+        pdo=ZA_PDO,
+        base_score=ZA_BASE_SCORE,
+        base_odds=ZA_BASE_ODDS,
     )
+    print("\nScorecard preview:")
+    print(scorecard.head(10).to_string(index=False))
 
-X = X[significant_features].copy()
-print(f"Filtered shape (significant features only): {X.shape}")
+    # 4. Calculate credit scores
+    print("\nCalculating credit scores...")
+    scores     = calculate_credit_score(X, scorecard, base_points_raw,
+                                        min_score=ZA_MIN_SCORE, max_score=ZA_MAX_SCORE)
+    risk_tiers = [get_risk_tier(s) for s in scores]
+    print("\nFirst 10 scores (South African scale):")
+    print(scores[:10])
 
+    # 5. Validate inverse relationship: higher score → lower PD
+    pd_values   = model.predict_proba(X)[:, 1]
+    correlation = np.corrcoef(scores, pd_values)[0, 1]
+    print("\nScore vs PD check (first 10 rows):")
+    print(pd.DataFrame({
+        "score":     scores[:10],
+        "pd":        pd_values[:10].round(4),
+        "risk_tier": risk_tiers[:10],
+    }).to_string(index=False))
+    print(f"\nCorrelation between score and PD: {correlation:.3f}  (should be negative)")
 
-# ---------------------------------------------------------------------------
-# 3. Build scorecard
-# ---------------------------------------------------------------------------
-print("\nBuilding scorecard...")
-scorecard, base_points_raw = build_scorecard(
-    model,
-    feature_names=significant_features,
-    pdo=ZA_PDO,
-    base_score=ZA_BASE_SCORE,
-    base_odds=ZA_BASE_ODDS,
-)
-
-print("\nScorecard preview:")
-print(scorecard.head(10).to_string(index=False))
-
-
-# ---------------------------------------------------------------------------
-# 4. Calculate credit scores
-# ---------------------------------------------------------------------------
-print("\nCalculating credit scores...")
-scores     = calculate_credit_score(X, scorecard, base_points_raw,
-                                    min_score=ZA_MIN_SCORE, max_score=ZA_MAX_SCORE)
-risk_tiers = [get_risk_tier(s) for s in scores]
-
-print("\nFirst 10 scores (South African scale):")
-print(scores[:10])
-
-
-# ---------------------------------------------------------------------------
-# 5. Validate inverse relationship: higher score → lower PD
-# ---------------------------------------------------------------------------
-pd_values   = model.predict_proba(X)[:, 1]
-correlation = np.corrcoef(scores, pd_values)[0, 1]
-
-print("\nScore vs PD check (first 10 rows):")
-print(pd.DataFrame({
-    "score":     scores[:10],
-    "pd":        pd_values[:10].round(4),
-    "risk_tier": risk_tiers[:10],
-}).to_string(index=False))
-
-print(f"\nCorrelation between score and PD: {correlation:.3f}  (should be negative)")
-
-
-# ---------------------------------------------------------------------------
-# 6. Attach scores and report distribution
-# ---------------------------------------------------------------------------
-X["credit_score"] = scores
-X["risk_tier"]    = risk_tiers
-
-print("\nScore distribution (South African scale):")
-print(X["credit_score"].describe())
-
-print("\nRisk tier distribution:")
-print(X["risk_tier"].value_counts())
+    # 6. Attach scores and report distribution
+    X["credit_score"] = scores
+    X["risk_tier"]    = risk_tiers
+    print("\nScore distribution (South African scale):")
+    print(X["credit_score"].describe())
+    print("\nRisk tier distribution:")
+    print(X["risk_tier"].value_counts())
