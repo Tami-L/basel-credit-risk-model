@@ -33,8 +33,13 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Paths  — update these to match your environment
 # ---------------------------------------------------------------------------
-DATA_DIR  = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/data"
-MODEL_DIR = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src"
+
+from pathlib import Path
+
+SRC_DIR   = Path(__file__).resolve().parent   # .../src/
+ROOT_DIR  = SRC_DIR.parent                    # .../basel-credit-risk-model/
+DATA_DIR  = ROOT_DIR / "data"
+MODEL_DIR = SRC_DIR
 
 INPUTS_TRAIN_PATH  = f"{DATA_DIR}/loan_data_inputs_train.csv"
 TARGETS_TRAIN_PATH = f"{DATA_DIR}/loan_data_targets_train.csv"

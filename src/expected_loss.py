@@ -32,8 +32,12 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DATA_DIR       = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/data"
-MODEL_DIR      = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src"
+from pathlib import Path
+
+SRC_DIR   = Path(__file__).resolve().parent   # .../src/
+ROOT_DIR  = SRC_DIR.parent                    # .../basel-credit-risk-model/
+DATA_DIR  = ROOT_DIR / "data"
+MODEL_DIR = SRC_DIR
 
 INPUTS_PATH    = f"{DATA_DIR}/loan_data_inputs_test.csv"
 EAD_PATH       = f"{DATA_DIR}/ead_test.csv"

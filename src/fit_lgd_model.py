@@ -27,7 +27,12 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-MODEL_DIR      = "/Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src"
+from pathlib import Path
+
+SRC_DIR   = Path(__file__).resolve().parent   # .../src/
+ROOT_DIR  = SRC_DIR.parent                    # .../basel-credit-risk-model/
+DATA_DIR  = ROOT_DIR / "data"
+MODEL_DIR = SRC_DIR
 LGD_SAVE_PATH  = f"{MODEL_DIR}/lgd_model.pkl"
 
 # ---------------------------------------------------------------------------
