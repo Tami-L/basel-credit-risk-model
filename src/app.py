@@ -7,10 +7,12 @@ import sys
 from datetime import datetime
 import plotly.graph_objects as go
 import plotly.express as px
+from scipy.stats import norm as _norm
 
 sys.path.append(os.path.dirname(__file__))
+
 from ETL import prepare_inputs
-from Scorecard import build_scorecard, calculate_credit_score, get_risk_tier
+from Scorecard import build_scorecard, calculate_credit_score, get_risk_tier, get_approval_decision
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -142,6 +144,36 @@ def load_lgd_model():
 
 
 # ---------------------------------------------------------------------------
+# Capital requirement helpers (Basel II IRB retail — §328)
+# ---------------------------------------------------------------------------
+def _basel_correlation(pd_arr):
+    """Asset correlation R for retail exposures (Basel II §328)."""
+    e50 = np.exp(-50)
+    return (
+        0.12 * (1 - np.exp(-50 * pd_arr)) / (1 - e50)
+        + 0.24 * (1 - (1 - np.exp(-50 * pd_arr)) / (1 - e50))
+    )
+
+
+def _capital_requirement(pd_arr, lgd_arr, ead_arr, maturity_adj=1.06):
+    """
+    Basel II IRB Retail capital requirement (§328).
+
+    K   = LGD × [N(G(PD)/√(1−R) + √(R/(1−R)) × G(0.999)) − PD] × 1.06
+    RWA = K × EAD × 12.5
+    """
+    pd_arr  = np.clip(pd_arr,  1e-6, 1 - 1e-6)
+    lgd_arr = np.clip(lgd_arr, 0, 1)
+    R       = _basel_correlation(pd_arr)
+    G_pd    = _norm.ppf(pd_arr)
+    G_999   = _norm.ppf(0.999)
+    N_arg   = G_pd / np.sqrt(1 - R) + np.sqrt(R / (1 - R)) * G_999
+    K       = lgd_arr * (_norm.cdf(N_arg) - pd_arr) * maturity_adj
+    rwa     = K * ead_arr * 12.5
+    return K, rwa
+
+
+# ---------------------------------------------------------------------------
 # Sidebar navigation
 # ---------------------------------------------------------------------------
 with st.sidebar:
@@ -180,9 +212,9 @@ if page == "🔍 Applicant Assessment":
     )
 
     # Load model artefacts
-    model = load_pd_model()
+    model                = load_pd_model()
     significant_features = load_features()
-    lgd_model = load_lgd_model()
+    lgd_model            = load_lgd_model()
 
     if model is None:
         st.error("pd_model.sav not found. Run fit_model.py first.")
@@ -191,8 +223,8 @@ if page == "🔍 Applicant Assessment":
         st.error("pd_model_features.pkl not found. Run fit_model.py first.")
         st.stop()
 
-    # Build scorecard from saved feature list
-    scorecard, base_points_raw = build_scorecard(
+    # Build scorecard — uses absolute PDO formula, no min-max scaling
+    scorecard, base_points = build_scorecard(
         model,
         feature_names=significant_features,
         pdo=50,
@@ -298,16 +330,23 @@ if page == "🔍 Applicant Assessment":
                     if col in X_prepared.columns:
                         X_final[col] = X_prepared[col].values[0]
 
-                X_arr      = X_final.values.astype(np.float64)
-                p_good     = model.predict_proba(X_arr)[0][1]
-                pd_val     = 1 - p_good          # PD = P(default)
-                el         = pd_val * lgd * ead
-                prediction = model.predict(X_arr)[0]
+                X_arr  = X_final.values.astype(np.float64)
+                p_good = model.predict_proba(X_arr)[0][1]
+                pd_val = 1 - p_good    # PD = P(default)
+                el     = pd_val * lgd * ead
 
+                # Absolute PDO credit score — decision driven by score
                 credit_score = calculate_credit_score(
-                    X_final, scorecard, base_points_raw, min_score=300, max_score=850
+                    X_final, scorecard, base_points, min_score=300, max_score=850
                 )[0]
                 risk_tier = get_risk_tier(credit_score)
+                decision  = get_approval_decision(credit_score)
+
+                # Capital requirement for this single loan
+                K_loan, rwa_loan = _capital_requirement(
+                    np.array([pd_val]), np.array([lgd]), np.array([ead])
+                )
+                cap_req_loan = float(K_loan[0] * ead)
 
                 # ----------------------------------------------------------
                 # Results
@@ -316,12 +355,12 @@ if page == "🔍 Applicant Assessment":
                 st.markdown("### Assessment Results")
 
                 m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("Credit Score",          f"{credit_score}")
-                m2.metric("Risk Tier",             risk_tier.split(" - ")[0])
-                m3.metric("Default Probability",   f"{pd_val:.2%}")
-                m4.metric("Expected Loss",         f"${el:,.0f}")
+                m1.metric("Credit Score",        f"{credit_score}")
+                m2.metric("Risk Tier",           risk_tier.split(" - ")[0])
+                m3.metric("Default Probability", f"{pd_val:.2%}")
+                m4.metric("Expected Loss",       f"${el:,.0f}")
                 m5.metric("Decision",
-                          "✅ Approve" if prediction == 0 else "❌ Reject")
+                          "✅ Approve" if decision == "Approve" else "❌ Decline")
 
                 # Gauge
                 score_color = (
@@ -369,6 +408,8 @@ if page == "🔍 Applicant Assessment":
 | LGD (Loss Given Default) | {lgd:.0%} |
 | PD (Probability of Default) | {pd_val:.4%} |
 | **EL = PD × LGD × EAD** | **${el:,.2f}** |
+| Capital Requirement (K × EAD) | ${cap_req_loan:,.2f} |
+| RWA | ${float(rwa_loan[0]):,.2f} |
 """)
                     if credit_score >= 670:
                         st.success("**Excellent Credit** — Low risk, favourable terms available.")
@@ -416,8 +457,8 @@ else:
     st.title("Portfolio Risk Dashboard")
     st.markdown(
         "<div style='color:#7a9bb5; margin-bottom:24px'>"
-        "Portfolio-level Expected Loss metrics computed from the test set. "
-        "EL = PD × LGD × EAD."
+        "Portfolio-level Expected Loss and Capital Requirement metrics "
+        "computed from the test set. EL = PD × LGD × EAD."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -440,16 +481,16 @@ else:
     # ------------------------------------------------------------------
     st.markdown("### Portfolio Overview")
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Loans",        f"{portfolio['n_loans']:,}")
-    k2.metric("Total EAD",          f"${portfolio['total_ead']:,.0f}")
-    k3.metric("Total Expected Loss", f"${portfolio['total_el']:,.0f}")
-    k4.metric("EL Rate",             f"{portfolio['el_rate']:.3%}")
-    k5.metric("Mean PD",             f"{portfolio['mean_pd']:.3%}")
+    k1.metric("Total Loans",         f"{portfolio['n_loans']:,}")
+    k2.metric("Total EAD",           f"${portfolio['total_ead']:,.0f}")
+    k3.metric("Total Expected Loss",  f"${portfolio['total_el']:,.0f}")
+    k4.metric("EL Rate",              f"{portfolio['el_rate']:.3%}")
+    k5.metric("Mean PD",              f"{portfolio['mean_pd']:.3%}")
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     k6, k7, k8 = st.columns(3)
-    k6.metric("Mean LGD",             f"{portfolio['mean_lgd']:.1%}")
-    k7.metric("Mean EAD per Loan",    f"${portfolio['mean_ead']:,.0f}")
+    k6.metric("Mean LGD",              f"{portfolio['mean_lgd']:.1%}")
+    k7.metric("Mean EAD per Loan",     f"${portfolio['mean_ead']:,.0f}")
     k8.metric("High-Risk Loans (PD≥50%)",
               f"{portfolio['n_high_risk']:,} ({portfolio['n_high_risk']/portfolio['n_loans']:.1%})")
 
@@ -516,7 +557,6 @@ else:
         st.plotly_chart(fig_pd, use_container_width=True)
 
     with r2c2:
-        # Sample for scatter performance
         sample = loan_level.sample(min(5000, len(loan_level)), random_state=42)
         fig_scatter = px.scatter(
             sample, x="ead", y="el", color="pd",
@@ -533,7 +573,7 @@ else:
         st.plotly_chart(fig_scatter, use_container_width=True)
 
     # ------------------------------------------------------------------
-    # Row 3: Grade composition + high-risk concentration
+    # Row 3: Grade composition + EL concentration curve
     # ------------------------------------------------------------------
     st.markdown("### Portfolio Composition")
     r3c1, r3c2 = st.columns(2)
@@ -555,7 +595,6 @@ else:
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with r3c2:
-        # EL concentration: top 10% riskiest loans
         loan_level_sorted = loan_level.sort_values("el", ascending=False).reset_index(drop=True)
         loan_level_sorted["cumulative_el_share"] = loan_level_sorted["el"].cumsum() / loan_level_sorted["el"].sum()
         loan_level_sorted["pct_of_portfolio"] = (loan_level_sorted.index + 1) / len(loan_level_sorted)
@@ -569,7 +608,6 @@ else:
             title="EL Concentration Curve",
             color_discrete_sequence=["#f97316"],
         )
-        # Lorenz reference line
         fig_conc.add_scatter(
             x=[0, 1], y=[0, 1],
             mode="lines",
@@ -607,11 +645,117 @@ else:
     st.dataframe(display_summary, use_container_width=True)
 
     st.markdown("---")
+
+    # ------------------------------------------------------------------
+    # Capital Requirements (Basel II IRB retail — §328)
+    # ------------------------------------------------------------------
+    st.markdown("### Capital Requirements")
+    st.markdown(
+        "<div style='color:#7a9bb5; margin-bottom:16px; font-size:0.88rem'>"
+        "Basel II IRB retail formula (§328): "
+        "K = LGD × [N(G(PD)/√(1−R) + √(R/(1−R)) × G(0.999)) − PD] × 1.06 &nbsp;·&nbsp; "
+        "RWA = K × EAD × 12.5 &nbsp;·&nbsp; "
+        "Min Tier 1 = 6% of RWA &nbsp;·&nbsp; Min Total = 8% of RWA"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    pd_arr  = loan_level["pd"].values
+    lgd_arr = loan_level["lgd"].values
+    ead_arr = loan_level["ead"].values
+
+    K_arr, rwa_arr = _capital_requirement(pd_arr, lgd_arr, ead_arr)
+
+    total_rwa     = rwa_arr.sum()
+    total_cap_req = (K_arr * ead_arr).sum()
+    min_cap_t1    = total_rwa * 0.06
+    min_cap_total = total_rwa * 0.08
+
+    cr1, cr2, cr3, cr4 = st.columns(4)
+    cr1.metric("Total RWA",                f"${total_rwa:,.0f}")
+    cr2.metric("Total Capital Required",   f"${total_cap_req:,.0f}")
+    cr3.metric("Min Capital (Tier 1, 6%)", f"${min_cap_t1:,.0f}")
+    cr4.metric("Min Capital (Total, 8%)",  f"${min_cap_total:,.0f}")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # Capital by grade
+    loan_level_cap               = loan_level.copy()
+    loan_level_cap["K"]          = K_arr
+    loan_level_cap["rwa"]        = rwa_arr
+    loan_level_cap["capital_required"] = K_arr * ead_arr
+
+    cap_by_grade = (
+        loan_level_cap.groupby("grade")
+        .agg(
+            total_rwa         = ("rwa",              "sum"),
+            total_capital_req = ("capital_required", "sum"),
+            mean_K            = ("K",                "mean"),
+        )
+        .assign(rwa_density=lambda d: d["total_rwa"] /
+                loan_level_cap.groupby("grade")["ead"].sum())
+        .sort_index()
+    )
+
+    cr_l, cr_r = st.columns(2)
+
+    with cr_l:
+        fig_rwa = px.bar(
+            cap_by_grade.reset_index(),
+            x="grade", y="total_rwa",
+            color="total_rwa",
+            color_continuous_scale=["#1a6baa", "#f97316", "#ef4444"],
+            labels={"total_rwa": "Total RWA ($)", "grade": "Grade"},
+            template="plotly_dark",
+            title="Risk-Weighted Assets (RWA) by Grade",
+        )
+        fig_rwa.update_layout(
+            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+            coloraxis_showscale=False,
+            margin=dict(t=40, b=20, l=0, r=0),
+        )
+        st.plotly_chart(fig_rwa, use_container_width=True)
+
+    with cr_r:
+        fig_k = px.bar(
+            cap_by_grade.reset_index(),
+            x="grade", y="mean_K",
+            color="mean_K",
+            color_continuous_scale=["#1a6baa", "#f97316", "#ef4444"],
+            labels={"mean_K": "Mean Capital Requirement (K)", "grade": "Grade"},
+            template="plotly_dark",
+            title="Mean Capital Requirement (K) by Grade",
+        )
+        fig_k.update_layout(
+            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+            coloraxis_showscale=False,
+            yaxis_tickformat=".2%",
+            margin=dict(t=40, b=20, l=0, r=0),
+        )
+        st.plotly_chart(fig_k, use_container_width=True)
+
+    # Capital requirements table
+    st.markdown("### Capital Requirements by Grade")
+    cap_display = cap_by_grade.copy()
+    cap_display["total_rwa"]         = cap_display["total_rwa"].map("${:,.0f}".format)
+    cap_display["total_capital_req"] = cap_display["total_capital_req"].map("${:,.0f}".format)
+    cap_display["mean_K"]            = cap_display["mean_K"].map("{:.3%}".format)
+    cap_display["rwa_density"]       = cap_display["rwa_density"].map("{:.2f}x".format)
+    cap_display = cap_display.rename(columns={
+        "total_rwa":         "Total RWA",
+        "total_capital_req": "Capital Required",
+        "mean_K":            "Mean K",
+        "rwa_density":       "RWA Density (RWA/EAD)",
+    })
+    st.dataframe(cap_display, use_container_width=True)
+
+    st.markdown("---")
     st.markdown(
         "<div style='font-size:0.75rem; color:#4a7fa5'>"
         f"Data: test split ({portfolio['n_loans']:,} loans) · "
         f"LGD: Basel II 45% constant · "
         f"EAD: funded_amnt − total_pymnt · "
+        f"Capital: Basel II IRB retail §328 · "
         f"Generated: {datetime.now().strftime('%Y-%m-%d')}"
         "</div>",
         unsafe_allow_html=True,
