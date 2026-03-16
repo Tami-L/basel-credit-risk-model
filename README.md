@@ -4,7 +4,7 @@
 
 This project implements a **credit risk modelling framework** based on Basel regulatory standards, focused on **Probability of Default (PD)** modelling using machine learning. It covers the full model lifecycle — ETL, training, validation, and scorecard generation — and is designed for **quantitative finance and risk management applications**.
 
-Key design decisions include handling of class imbalance (the dataset is ~89% good loans / 11% bad loans), statistically rigorous feature selection via p-value filtering, and a shared feature-list artefact that keeps all downstream scripts automatically in sync with the trained model.
+Key design decisions include handling of class imbalance (the dataset is ~89% good loans / 11% bad loans), statistically rigorous feature selection via p-value filtering, a shared feature-list artefact that keeps all downstream scripts in sync with the trained model, and a full Basel-compliant Expected Loss (EL = PD × LGD × EAD) computation pipeline.
 
 ---
 
@@ -17,19 +17,25 @@ basel-credit-risk-model/
 │   ├── loan_data_inputs_train.csv                         # Preprocessed training features
 │   ├── loan_data_targets_train.csv                        # Training labels
 │   ├── loan_data_inputs_test.csv                          # Preprocessed test features
-│   └── loan_data_targets_test.csv                         # Test labels
+│   ├── loan_data_targets_test.csv                         # Test labels
+│   ├── ead_train.csv                                      # EAD per loan — train split (generated)
+│   └── ead_test.csv                                       # EAD per loan — test split (generated)
 ├── src/
 │   ├── __pycache__/                                       # Python bytecode cache (not versioned)
 │   ├── mlruns/                                            # MLflow experiment tracking data
 │   ├── app.py                                             # Application entry point
 │   ├── Credit Risk Modeling - Model Fitting.ipynb         # Model training notebook (original)
 │   ├── Credit Risk Modeling - Preparation.ipynb           # Data preparation notebook (original)
-│   ├── ETL.py                                             # ETL: feature engineering & train/test split
-│   ├── fit_model.py                                       # Model training & MLflow experiment tracking
+│   ├── ETL.py                                             # ETL: feature engineering, EAD & train/test split
+│   ├── fit_model.py                                       # PD model training & MLflow experiment tracking
+│   ├── fit_lgd_model.py                                   # LGD model (Basel II constant, grade-segmented)
+│   ├── expected_loss.py                                   # EL = PD × LGD × EAD computation
 │   ├── mlflow.db                                          # MLflow tracking database
 │   ├── Model_Validation.py                                # Model validation & performance metrics
 │   ├── pd_model_features.pkl                              # Significant feature list (generated)
 │   ├── pd_model.sav                                       # Serialised final PD model (generated)
+│   ├── lgd_model.pkl                                      # Serialised LGD model (generated)
+│   ├── el_results.pkl                                     # Loan-level & portfolio EL results (generated)
 │   └── Scorecard.py                                       # Credit scorecard generation
 ├── .gitignore
 ├── LICENSE
@@ -46,7 +52,8 @@ Handles all data preparation before modelling:
 - Parses and engineers date, categorical, and continuous features (employment length, credit history age, interest rate bins, etc.)
 - One-hot encodes categorical columns, fitting the encoder on the **training set only** to prevent data leakage
 - Computes imputation statistics (e.g. mean annual income) from the training set and applies them to both splits
-- Splits data into train/test sets and saves four CSV artefacts to `data/`
+- Computes **EAD = `funded_amnt` − `total_pymnt`** (floored at 0) from the raw data before splitting, then aligns to train/test indices
+- Saves six CSV artefacts to `data/`: inputs, targets, and EAD for both train and test splits
 
 ### `app.py`
 Application entry point for the project.
@@ -80,6 +87,19 @@ Converts the trained model's coefficients into an interpretable credit scorecard
 - Validates the inverse relationship between score and predicted PD
 - Feature selection driven by `pd_model_features.pkl`
 
+### `fit_lgd_model.py`
+Builds a grade-segmented Loss Given Default (LGD) model:
+- Applies the **Basel II regulatory constant of 45%** for unsecured retail exposures uniformly across all grades
+- Saves a grade-keyed lookup table as `lgd_model.pkl`
+- Structured so that per-grade values can be replaced with empirical recovery-rate estimates when recovery data becomes available — no downstream changes required
+
+### `expected_loss.py`
+Combines PD, LGD, and EAD to compute Expected Loss at loan and portfolio level:
+- Loads `pd_model.sav`, `pd_model_features.pkl`, `lgd_model.pkl`, and `ead_test.csv`
+- Reconstructs raw grade labels from one-hot encoded inputs to look up LGD
+- Computes **EL = PD × LGD × EAD** for every loan
+- Outputs a loan-level DataFrame, a grade-level summary table, and scalar portfolio metrics (total EAD, total EL, EL rate, mean PD, high-risk loan share) saved together in `el_results.pkl`
+
 ---
 
 ## Key Design Decisions
@@ -91,6 +111,9 @@ Converts the trained model's coefficients into an interpretable credit scorecard
 | `pd_model_features.pkl` shared artefact | Saves the exact post-filter, post-zero-variance-drop feature list so validation and scorecard scripts never go out of sync with the model |
 | OHE fitted on train only | Prevents test-set category distributions from leaking into the encoder |
 | `StratifiedKFold` for threshold optimisation | Preserves class distribution across folds given the imbalance |
+| EAD computed pre-split from raw data | Ensures EAD index stays aligned with train/test feature splits |
+| LGD structured as a lookup table | Basel II constant now; swappable for empirical estimates later without changing `expected_loss.py` |
+| `el_results.pkl` bundles loan + grade + portfolio | Single artefact gives the dashboard everything it needs in one load |
 
 ---
 
@@ -121,16 +144,22 @@ pip install -r requirements.txt
 Run the scripts in order:
 
 ```bash
-# 1. Run ETL → writes train/test CSVs to data/
+# 1. Run ETL → writes train/test CSVs + EAD CSVs to data/
 python src/ETL.py
 
-# 2. Train models → writes pd_model.sav and pd_model_features.pkl to src/
+# 2. Train PD model → writes pd_model.sav and pd_model_features.pkl to src/
 python src/fit_model.py
 
-# 3. Validate on test set
+# 3. Build LGD model → writes lgd_model.pkl to src/
+python src/fit_lgd_model.py
+
+# 4. Compute Expected Loss → writes el_results.pkl to src/
+python src/expected_loss.py
+
+# 5. Validate PD model on test set
 python src/Model_Validation.py
 
-# 4. Generate scorecard
+# 6. Generate scorecard
 python src/Scorecard.py
 ```
 
@@ -153,7 +182,8 @@ mlflow ui --backend-store-uri src/mlruns
 
 ## Notes
 
-- `pd_model.sav` and `pd_model_features.pkl` are generated artefacts — they are not versioned and must be regenerated by running `fit_model.py`
+- `pd_model.sav`, `pd_model_features.pkl`, `lgd_model.pkl`, and `el_results.pkl` are generated artefacts — they are not versioned and must be regenerated by running the pipeline in order
+- `ead_train.csv` and `ead_test.csv` in `data/` are also generated — re-run `ETL.py` to regenerate them
 - Raw loan data is not included in the repository due to size constraints
 - The scorecard uses South African credit bureau score ranges (300–850); these can be adjusted via constants at the top of `Scorecard.py`
 - `Credit Risk Modeling - Model Fitting.ipynb` and `Credit Risk Modeling - Preparation.ipynb` are the original exploratory notebooks; the production logic has been refactored into the `.py` scripts
