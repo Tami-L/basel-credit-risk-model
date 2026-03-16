@@ -1,5 +1,6 @@
 # Basel Credit Risk Model
 
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://tami-l-basel-credit-risk-model-srcapp-dbjaph.streamlit.app/)
 ## Overview
 
 This project implements a **credit risk modelling framework** based on Basel regulatory standards, focused on **Probability of Default (PD)** modelling using machine learning. It covers the full model lifecycle — ETL, training, validation, and scorecard generation — and is designed for **quantitative finance and risk management applications**.
