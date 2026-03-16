@@ -1,7 +1,0 @@
-artifact_location: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/502378459212952797
-creation_time: 1773160946200
-experiment_id: '502378459212952797'
-last_update_time: 1773160946200
-lifecycle_stage: active
-name: credit_risk_pd_model
-workspace: default

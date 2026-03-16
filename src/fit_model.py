@@ -447,9 +447,6 @@ def main():
         pickle.dump(reg2_final.model, f)
     print(f"\nModel successfully saved to: {MODEL_SAVE_PATH}")
 
-    # Use the feature names that survived both the p-value filter AND
-    # the zero-variance drop inside LogisticRegressionWithPValues.fit().
-    # These are the names that exactly correspond to model.coef_.
     significant_features = reg2_final.feature_names_in_
     with open(FEATURES_SAVE_PATH, "wb") as f:
         pickle.dump(significant_features, f)
