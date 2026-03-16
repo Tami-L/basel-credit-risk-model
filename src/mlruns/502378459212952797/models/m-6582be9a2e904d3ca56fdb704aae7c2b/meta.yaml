@@ -1,0 +1,10 @@
+artifact_location: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/502378459212952797/models/m-6582be9a2e904d3ca56fdb704aae7c2b/artifacts
+creation_timestamp: 1773653039851
+experiment_id: '502378459212952797'
+last_updated_timestamp: 1773653043401
+model_id: m-6582be9a2e904d3ca56fdb704aae7c2b
+model_type: null
+name: rf_model
+source_run_id: 247278e2d11b4624b5f00db6525014a9
+status: 2
+status_message: null

@@ -1,0 +1,23 @@
+artifact_path: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/502378459212952797/models/m-6582be9a2e904d3ca56fdb704aae7c2b/artifacts
+flavors:
+  python_function:
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.sklearn
+    model_path: model.pkl
+    predict_fn: predict
+    python_version: 3.12.2
+  sklearn:
+    code: null
+    pickled_model: model.pkl
+    serialization_format: cloudpickle
+    sklearn_version: 1.8.0
+    skops_trusted_types: null
+mlflow_version: 3.10.1
+model_id: m-6582be9a2e904d3ca56fdb704aae7c2b
+model_size_bytes: 6817424
+model_uuid: m-6582be9a2e904d3ca56fdb704aae7c2b
+prompts: null
+run_id: 247278e2d11b4624b5f00db6525014a9
+utc_time_created: '2026-03-16 09:23:59.864034'

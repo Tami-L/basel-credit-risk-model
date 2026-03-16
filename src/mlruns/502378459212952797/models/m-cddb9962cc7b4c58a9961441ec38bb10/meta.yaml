@@ -1,0 +1,10 @@
+artifact_location: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/502378459212952797/models/m-cddb9962cc7b4c58a9961441ec38bb10/artifacts
+creation_timestamp: 1773652660448
+experiment_id: '502378459212952797'
+last_updated_timestamp: 1773652664061
+model_id: m-cddb9962cc7b4c58a9961441ec38bb10
+model_type: null
+name: logistic_model
+source_run_id: 83f9544c147e4006985cb370e3975408
+status: 2
+status_message: null
