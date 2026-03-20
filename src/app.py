@@ -11,8 +11,6 @@ from scipy.stats import norm as _norm
 
 sys.path.append(os.path.dirname(__file__))
 
-# Must import before unpickling — pickle needs to find these classes
-from model_classes import LogisticRegressionWithPValues, ThresholdClassifier  # noqa: F401
 from ETL import prepare_inputs
 from Scorecard import build_scorecard, calculate_credit_score, get_risk_tier, get_approval_decision
 

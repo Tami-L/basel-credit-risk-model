@@ -433,9 +433,9 @@ def split_and_prepare(
         test_df,
         reference_date=reference_date,
         target_col="good_bad",
-        ohe=ohe,                    # reuse fitted OHE — no refit
+        ohe=ohe,                   
         fit_ohe=False,
-        train_params=train_params,  # reuse train statistics — no recompute
+        train_params=train_params,  
         fit_train_params=False,
     )
 
@@ -493,9 +493,7 @@ if __name__ == "__main__":
     src = '/Users/lindokuhletami/Desktop/Space/data/loan_data_2007_2014(1).csv'
     df = load_data(str(src))
 
-    # Compute EAD from the raw data BEFORE the train/test split so that
-    # the index alignment is preserved. We then split EAD in sync with
-    # the feature split using the same random_state.
+   
     from sklearn.model_selection import train_test_split as _tts
     ead_full = compute_ead(df)
 

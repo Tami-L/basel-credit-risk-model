@@ -113,7 +113,7 @@ def main():
     # ------------------------------------------------------------------
     print("\nLoading data...")
     inputs = pd.read_csv(INPUTS_PATH)
-    ead    = pd.read_csv(EAD_PATH).squeeze()   # single-column CSV → Series
+    ead    = pd.read_csv(EAD_PATH).squeeze()   # single-column CSV
 
     print(f"  Inputs shape: {inputs.shape}")
     print(f"  EAD shape:    {ead.shape}")
