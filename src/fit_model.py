@@ -11,12 +11,9 @@ import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import scipy.stats as stat
-
 import mlflow
 import mlflow.sklearn
 
-from sklearn import linear_model, metrics
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
@@ -33,20 +30,18 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 # Paths  — update these to match your environment
 # ---------------------------------------------------------------------------
-
 from pathlib import Path
 
-SRC_DIR   = Path(__file__).resolve().parent   # .../src/
-ROOT_DIR  = SRC_DIR.parent                    # .../basel-credit-risk-model/
+SRC_DIR   = Path(__file__).resolve().parent        # .../src/
+ROOT_DIR  = SRC_DIR.parent                          # .../basel-credit-risk-model/
 DATA_DIR  = ROOT_DIR / "data"
 MODEL_DIR = SRC_DIR
 
-INPUTS_TRAIN_PATH  = f"{DATA_DIR}/loan_data_inputs_train.csv"
-TARGETS_TRAIN_PATH = f"{DATA_DIR}/loan_data_targets_train.csv"
-MODEL_SAVE_PATH    = f"{MODEL_DIR}/pd_model.sav"
-# Significant feature list — loaded by the validation script to apply
-# the same column selection that was determined during training
-FEATURES_SAVE_PATH = f"{MODEL_DIR}/pd_model_features.pkl"
+INPUTS_TRAIN_PATH  = DATA_DIR  / "loan_data_inputs_train.csv"
+TARGETS_TRAIN_PATH = DATA_DIR  / "loan_data_targets_train.csv"
+MODEL_SAVE_PATH    = MODEL_DIR / "pd_model.sav"
+FEATURES_SAVE_PATH  = MODEL_DIR / "pd_model_features.pkl"
+THRESHOLD_SAVE_PATH = MODEL_DIR / "pd_model_threshold.pkl"
 
 
 # ---------------------------------------------------------------------------
@@ -130,16 +125,22 @@ REF_CATEGORIES = [
 
 
 # ---------------------------------------------------------------------------
-# Logistic Regression wrapper that also computes p-values
+# LogisticRegressionWithPValues — defined here, only used during training.
+# We never pickle this class — only the inner sklearn model is saved.
 # ---------------------------------------------------------------------------
+import scipy.stats as stat
+from sklearn import linear_model
+
+
 class LogisticRegressionWithPValues:
-    """Wraps sklearn LogisticRegression and attaches Wald-test p-values."""
+    """Wraps sklearn LogisticRegression and attaches Wald-test p-values.
+    Only used during training. Never serialised to disk.
+    """
 
     def __init__(self, *args, **kwargs):
         self.model = linear_model.LogisticRegression(*args, **kwargs)
 
     def fit(self, X, y):
-        # Keep track of the original column names/index before any filtering
         if hasattr(X, 'columns'):
             original_names = list(X.columns)
         else:
@@ -148,8 +149,6 @@ class LogisticRegressionWithPValues:
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float)
 
-        # Drop zero-variance (constant) columns to avoid a singular matrix.
-        # Record the mask so callers can retrieve the surviving feature names.
         var = X.var(axis=0)
         self.feature_mask_ = var > 0
         if not self.feature_mask_.all():
@@ -165,7 +164,7 @@ class LogisticRegressionWithPValues:
 
         denom = 2.0 * (1.0 + np.cosh(self.model.decision_function(X)))
         denom = np.tile(denom, (X.shape[1], 1)).T
-        F_ij = np.dot((X / denom).T, X).astype(float)
+        F_ij  = np.dot((X / denom).T, X).astype(float)
 
         try:
             Cramer_Rao = np.linalg.inv(F_ij)
@@ -173,8 +172,8 @@ class LogisticRegressionWithPValues:
             Cramer_Rao = np.linalg.pinv(F_ij)
 
         sigma_estimates = np.sqrt(np.diagonal(Cramer_Rao))
-        z_scores = self.model.coef_[0] / sigma_estimates
-        self.p_values = [stat.norm.sf(abs(z)) * 2 for z in z_scores]
+        z_scores        = self.model.coef_[0] / sigma_estimates
+        self.p_values   = [stat.norm.sf(abs(z)) * 2 for z in z_scores]
         self.coef_      = self.model.coef_
         self.intercept_ = self.model.intercept_
 
@@ -184,7 +183,7 @@ class LogisticRegressionWithPValues:
 # ---------------------------------------------------------------------------
 def build_summary_table(model_wrapper, feature_names):
     coefs = model_wrapper.coef_.ravel()
-    names = feature_names[: coefs.size]
+    names = list(feature_names)[: coefs.size]
 
     summary = pd.DataFrame({"Feature name": names, "Coefficients": coefs})
     summary.index = range(1, len(summary) + 1)
@@ -197,11 +196,27 @@ def build_summary_table(model_wrapper, feature_names):
 
 
 # ---------------------------------------------------------------------------
-# Threshold optimisation via cross-validation
+# Threshold optimisation using sklearn's StratifiedKFold + cross_val_predict
 # ---------------------------------------------------------------------------
-def optimise_threshold(model_wrapper, X, y):
+def optimise_threshold(model, X, y, cv_splits: int = 5) -> float:
+    """
+    Find the probability threshold that maximises F1 score using
+    sklearn's cross_val_predict with StratifiedKFold — no manual
+    loop required.
+
+    Parameters
+    ----------
+    model     : fitted sklearn model with predict_proba()
+    X         : feature DataFrame
+    y         : target array/Series
+    cv_splits : number of CV folds (default 5)
+
+    Returns
+    -------
+    optimal_threshold : float — best threshold based on F1 score
+    """
     print("\n" + "=" * 50)
-    print("OPTIMIZING THRESHOLD VIA CROSS-VALIDATION")
+    print("OPTIMISING THRESHOLD VIA CROSS-VALIDATION")
     print("=" * 50)
 
     y_arr = np.array(y).ravel()
@@ -211,78 +226,115 @@ def optimise_threshold(model_wrapper, X, y):
     for cls, count in zip(unique_classes, class_counts):
         print(f"  Class {cls}: {count} samples ({count / len(y_arr) * 100:.2f}%)")
 
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # sklearn's cross_val_predict handles splitting, fitting on each fold,
+    # and collecting out-of-fold predictions automatically.
+    cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
+    y_proba_cv = cross_val_predict(model, X, y_arr, cv=cv, method="predict_proba")
+    y_proba_cv = y_proba_cv[:, 1]   # probability of class 1 (good loan)
 
-    try:
-        y_proba_cv = cross_val_predict(
-            model_wrapper.model, X, y_arr, cv=cv, method="predict_proba"
-        )
-        print(f"\nCV predictions shape: {y_proba_cv.shape}")
-        if y_proba_cv.shape[1] == 2:
-            y_proba_cv = y_proba_cv[:, 1]
-        else:
-            y_proba_cv = y_proba_cv.ravel()
-    except Exception as exc:
-        print(f"Error in cross_val_predict: {exc}\nFalling back to manual CV...")
-        y_proba_cv = np.zeros(len(y_arr))
-        for train_idx, val_idx in cv.split(X, y_arr):
-            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_tr = y_arr[train_idx]
-            model_wrapper.model.fit(X_tr, y_tr)
-            fold_proba = model_wrapper.model.predict_proba(X_val)
-            y_proba_cv[val_idx] = (
-                fold_proba[:, 1] if fold_proba.shape[1] == 2 else fold_proba.ravel()
-            )
-        print("Manual CV completed")
+    print(f"\nCV out-of-fold predictions collected: {len(y_proba_cv)} samples")
 
-    thresholds       = np.arange(0.1, 0.9, 0.05)
-    f1_scores        = []
-    precision_scores = []
-    recall_scores    = []
-    accuracy_scores  = []
+    # Sweep thresholds and record metrics.
+    # IMPORTANT: we optimise on the MINORITY CLASS (bad loans = 0) F1,
+    # not the macro/majority F1. Optimising on macro F1 with an 89/11
+    # imbalance always picks the lowest threshold (predict everything
+    # as good), which is useless for credit risk.
+    thresholds            = np.arange(0.1, 0.91, 0.01)
+    f1_bad_scores         = []   # F1 for class 0 (bad loans) — our target
+    precision_bad_scores  = []
+    recall_bad_scores     = []
+    f1_macro_scores       = []
+    accuracy_scores       = []
 
     for t in thresholds:
-        y_pred = (y_proba_cv > t).astype(int)
+        y_pred = (y_proba_cv >= t).astype(int)
         if len(np.unique(y_pred)) == 2:
-            f1_scores.append(f1_score(y_arr, y_pred))
-            precision_scores.append(precision_score(y_arr, y_pred))
-            recall_scores.append(recall_score(y_arr, y_pred))
+            f1_bad_scores.append(f1_score(y_arr, y_pred, pos_label=0))
+            precision_bad_scores.append(precision_score(y_arr, y_pred, pos_label=0))
+            recall_bad_scores.append(recall_score(y_arr, y_pred, pos_label=0))
+            f1_macro_scores.append(f1_score(y_arr, y_pred))
         else:
-            f1_scores.append(0)
-            precision_scores.append(0)
-            recall_scores.append(0)
+            f1_bad_scores.append(0.0)
+            precision_bad_scores.append(0.0)
+            recall_bad_scores.append(0.0)
+            f1_macro_scores.append(0.0)
         accuracy_scores.append(np.mean(y_pred == y_arr))
 
-    opt_idx_f1  = int(np.argmax(f1_scores))
+    # ------------------------------------------------------------------
+    # Objective: MAXIMISE RECALL of bad loans (catch as many defaulters
+    # as possible), subject to a minimum precision floor.
+    #
+    # Why constrained? Pure recall maximisation always picks the lowest
+    # threshold (flag everything as bad → recall=1.0, precision=~11%).
+    # The precision floor ensures the model is still actionable — at least
+    # MIN_PRECISION of flagged loans must actually be bad.
+    #
+    # Given the 89/11 class split in this dataset, 20% precision means
+    # the model is ~2x more accurate than random at flagging defaulters.
+    # ------------------------------------------------------------------
+    MIN_PRECISION = 0.20   # tune this — lower = catch more, reject more good loans
+
+    precision_arr = np.array(precision_bad_scores)
+    recall_arr    = np.array(recall_bad_scores)
+    f1_arr        = np.array(f1_bad_scores)
+
+    valid_mask = precision_arr >= MIN_PRECISION
+    if valid_mask.any():
+        # Among thresholds that meet the precision floor,
+        # pick the one with the highest recall
+        valid_recalls     = np.where(valid_mask, recall_arr, 0.0)
+        opt_idx_primary   = int(np.argmax(valid_recalls))
+        primary_method    = f"max recall (precision >= {MIN_PRECISION:.0%})"
+    else:
+        # Fallback: no threshold meets the floor — use best F1 instead
+        opt_idx_primary   = int(np.argmax(f1_arr))
+        primary_method    = "best F1 (precision floor not met)"
+
+    opt_thr_primary = thresholds[opt_idx_primary]
+
+    # Also compute F1-optimal and accuracy-optimal for reference
+    opt_idx_f1  = int(np.argmax(f1_arr))
     opt_thr_f1  = thresholds[opt_idx_f1]
     opt_idx_acc = int(np.argmax(accuracy_scores))
     opt_thr_acc = thresholds[opt_idx_acc]
 
-    print(f"\nOptimal threshold (based on F1 score): {opt_thr_f1:.2f}")
-    print(f"F1 score at optimal threshold:         {f1_scores[opt_idx_f1]:.4f}")
-    print(f"Precision at optimal threshold:        {precision_scores[opt_idx_f1]:.4f}")
-    print(f"Recall at optimal threshold:           {recall_scores[opt_idx_f1]:.4f}")
-    print(f"Accuracy at optimal threshold:         {accuracy_scores[opt_idx_f1]:.4f}")
-    print(f"\nOptimal threshold (based on Accuracy): {opt_thr_acc:.2f}")
-    print(f"Accuracy at optimal threshold:         {accuracy_scores[opt_idx_acc]:.4f}")
+    print(f"\n--- Primary objective: {primary_method} ---")
+    print(f"Optimal threshold:           {opt_thr_primary:.2f}")
+    print(f"  Recall    (bad loan / 0):  {recall_arr[opt_idx_primary]:.4f}")
+    print(f"  Precision (bad loan / 0):  {precision_arr[opt_idx_primary]:.4f}")
+    print(f"  F1        (bad loan / 0):  {f1_arr[opt_idx_primary]:.4f}")
+    print(f"  F1        (macro):         {f1_macro_scores[opt_idx_primary]:.4f}")
+    print(f"  Accuracy:                  {accuracy_scores[opt_idx_primary]:.4f}")
+    print(f"\n--- Reference: best bad-loan F1 ---")
+    print(f"Threshold: {opt_thr_f1:.2f}  |  "
+          f"F1: {f1_arr[opt_idx_f1]:.4f}  |  "
+          f"Rec: {recall_arr[opt_idx_f1]:.4f}  |  "
+          f"Pre: {precision_arr[opt_idx_f1]:.4f}")
+    print(f"\n--- Reference: best accuracy ---")
+    print(f"Threshold: {opt_thr_acc:.2f}  |  "
+          f"Accuracy: {accuracy_scores[opt_idx_acc]:.4f}")
 
     # Plot
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    axes[0].plot(thresholds, f1_scores,        marker="o", label="F1 Score",  linewidth=2)
-    axes[0].plot(thresholds, precision_scores, marker="s", label="Precision", linewidth=2)
-    axes[0].plot(thresholds, recall_scores,    marker="^", label="Recall",    linewidth=2)
-    axes[0].axvline(x=opt_thr_f1, color="r", linestyle="--",
-                    label=f"Optimal F1: {opt_thr_f1:.2f}")
+    axes[0].plot(thresholds, recall_arr,    linewidth=2.5, label="Recall (bad loan)")
+    axes[0].plot(thresholds, precision_arr, linewidth=2.5, label="Precision (bad loan)")
+    axes[0].plot(thresholds, f1_arr,        linewidth=2,   label="F1 (bad loan)", linestyle="--")
+    axes[0].axhline(MIN_PRECISION, color="grey", linestyle=":", linewidth=1.5,
+                    label=f"Precision floor ({MIN_PRECISION:.0%})")
+    axes[0].axvline(opt_thr_primary, color="r", linestyle="--", linewidth=2,
+                    label=f"Selected: {opt_thr_primary:.2f}")
     axes[0].set_xlabel("Threshold")
     axes[0].set_ylabel("Score")
-    axes[0].set_title("Threshold Optimisation — Classification Metrics")
+    axes[0].set_title("Threshold Optimisation — Bad Loan (Class 0)")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(thresholds, accuracy_scores, marker="o", color="green", linewidth=2)
-    axes[1].axvline(x=opt_thr_acc, color="r", linestyle="--",
-                    label=f"Optimal Acc: {opt_thr_acc:.2f}")
+    axes[1].plot(thresholds, accuracy_scores, color="green", linewidth=2)
+    axes[1].axvline(opt_thr_acc, color="r", linestyle="--",
+                    label=f"Best Accuracy: {opt_thr_acc:.2f}")
+    axes[1].axvline(opt_thr_primary, color="blue", linestyle="--",
+                    label=f"Selected: {opt_thr_primary:.2f}")
     axes[1].set_xlabel("Threshold")
     axes[1].set_ylabel("Accuracy")
     axes[1].set_title("Threshold Optimisation — Accuracy")
@@ -291,6 +343,8 @@ def optimise_threshold(model_wrapper, X, y):
 
     plt.tight_layout()
     plt.show()
+
+    return float(opt_thr_primary)
 
 
 # ---------------------------------------------------------------------------
@@ -339,23 +393,22 @@ def main():
         recall    = recall_score(y, preds)
         f1        = f1_score(y, preds)
 
-        mlflow.log_param("model_type",    "logistic_regression")
-        mlflow.log_param("max_iter",      1000)
-        mlflow.log_param("class_weight",  "balanced")
-        mlflow.log_metric("AUC",          auc)
-        mlflow.log_metric("precision",    precision)
-        mlflow.log_metric("recall",       recall)
-        mlflow.log_metric("f1_score",     f1)
+        mlflow.log_param("model_type",   "logistic_regression")
+        mlflow.log_param("max_iter",     1000)
+        mlflow.log_param("class_weight", "balanced")
+        mlflow.log_metric("AUC",         auc)
+        mlflow.log_metric("precision",   precision)
+        mlflow.log_metric("recall",      recall)
+        mlflow.log_metric("f1_score",    f1)
         mlflow.sklearn.log_model(lr_model, "logistic_model")
 
-        print(f"AUC:                        {auc}")
-        print(f"Precision (macro):          {precision}")
-        print(f"Recall    (macro):          {recall}")
-        print(f"F1        (macro):          {f1}")
-        # Minority-class (bad loan = 0) metrics
-        print(f"Precision (bad loan / 0):   {precision_score(y, preds, pos_label=0):.4f}")
-        print(f"Recall    (bad loan / 0):   {recall_score(y, preds, pos_label=0):.4f}")
-        print(f"F1        (bad loan / 0):   {f1_score(y, preds, pos_label=0):.4f}")
+        print(f"AUC:                      {auc:.4f}")
+        print(f"Precision (macro):        {precision:.4f}")
+        print(f"Recall    (macro):        {recall:.4f}")
+        print(f"F1        (macro):        {f1:.4f}")
+        print(f"Precision (bad loan / 0): {precision_score(y, preds, pos_label=0):.4f}")
+        print(f"Recall    (bad loan / 0): {recall_score(y, preds, pos_label=0):.4f}")
+        print(f"F1        (bad loan / 0): {f1_score(y, preds, pos_label=0):.4f}")
 
     # ------------------------------------------------------------------
     # 5. Random Forest
@@ -385,14 +438,13 @@ def main():
         mlflow.log_metric("f1_score",    rf_f1)
         mlflow.sklearn.log_model(rf_model, "rf_model")
 
-        print(f"Random Forest AUC:                        {rf_auc}")
-        print(f"Precision (macro):                        {rf_precision}")
-        print(f"Recall    (macro):                        {rf_recall}")
-        print(f"F1        (macro):                        {rf_f1}")
-        # Minority-class (bad loan = 0) metrics
-        print(f"Precision (bad loan / 0):                 {precision_score(y, rf_preds, pos_label=0):.4f}")
-        print(f"Recall    (bad loan / 0):                 {recall_score(y, rf_preds, pos_label=0):.4f}")
-        print(f"F1        (bad loan / 0):                 {f1_score(y, rf_preds, pos_label=0):.4f}")
+        print(f"Random Forest AUC:        {rf_auc:.4f}")
+        print(f"Precision (macro):        {rf_precision:.4f}")
+        print(f"Recall    (macro):        {rf_recall:.4f}")
+        print(f"F1        (macro):        {rf_f1:.4f}")
+        print(f"Precision (bad loan / 0): {precision_score(y, rf_preds, pos_label=0):.4f}")
+        print(f"Recall    (bad loan / 0): {recall_score(y, rf_preds, pos_label=0):.4f}")
+        print(f"F1        (bad loan / 0): {f1_score(y, rf_preds, pos_label=0):.4f}")
 
     # ------------------------------------------------------------------
     # 6. Logistic Regression with p-values — initial fit
@@ -410,7 +462,6 @@ def main():
     # ------------------------------------------------------------------
     P_VALUE_THRESHOLD = 0.05
 
-    # Row 0 is the intercept (p-value = NaN), so skip it
     insignificant_features = summary_table[
         (summary_table.index > 0) & (summary_table["p_values"] > P_VALUE_THRESHOLD)
     ]["Feature name"].tolist()
@@ -441,21 +492,75 @@ def main():
     print(summary_table_final.to_string())
 
     # ------------------------------------------------------------------
-    # 9. Threshold optimisation via cross-validation (final model)
+    # 9. Find optimal threshold using sklearn CV (no manual loop).
+    #
+    #    Pass reg2_final.model (the raw sklearn LR) and only the columns
+    #    it was actually fitted on (feature_names_in_), NOT the full
+    #    inputs_train_significant which still contains the zero-variance
+    #    columns that were dropped inside the wrapper's fit().
     # ------------------------------------------------------------------
-    optimise_threshold(reg2_final, inputs_train_significant, loan_data_targets_train)
+    model_features_for_cv = reg2_final.feature_names_in_
+    optimal_threshold = optimise_threshold(
+        reg2_final.model,
+        inputs_train_significant[model_features_for_cv],
+        loan_data_targets_train,
+    )
 
     # ------------------------------------------------------------------
-    # 10. Save the final model and its significant feature list
+    # 10. Evaluate the final model at the optimal threshold and log to
+    #     MLflow. We use the raw sklearn model + apply threshold manually
+    #     — no custom wrapper class, so pickle works everywhere.
+    # ------------------------------------------------------------------
+    model_features = reg2_final.feature_names_in_
+    X_model        = inputs_train_significant[model_features]
+    y_arr          = np.array(loan_data_targets_train).ravel()
+
+    final_preds_proba = reg2_final.model.predict_proba(X_model)[:, 1]
+    final_preds       = (final_preds_proba >= optimal_threshold).astype(int)
+
+    final_auc = roc_auc_score(y_arr, final_preds_proba)
+    final_f1  = f1_score(y_arr, final_preds)
+
+    with mlflow.start_run(run_name="pd_model_final"):
+        mlflow.log_param("model_type",         "logistic_regression_pvalues")
+        mlflow.log_param("class_weight",        "balanced")
+        mlflow.log_param("p_value_threshold",   P_VALUE_THRESHOLD)
+        mlflow.log_param("n_features",          len(model_features))
+        mlflow.log_param("optimal_threshold",   optimal_threshold)
+        mlflow.log_metric("AUC",                final_auc)
+        mlflow.log_metric("f1_score",           final_f1)
+        mlflow.log_metric("precision_bad_loan", precision_score(y_arr, final_preds, pos_label=0))
+        mlflow.log_metric("recall_bad_loan",    recall_score(y_arr, final_preds, pos_label=0))
+        mlflow.log_metric("f1_bad_loan",        f1_score(y_arr, final_preds, pos_label=0))
+
+    print(f"\nFinal model at threshold {optimal_threshold:.2f}:")
+    print(f"  AUC:                  {final_auc:.4f}")
+    print(f"  F1 (macro):           {final_f1:.4f}")
+    print(f"  Precision (bad loan): {precision_score(y_arr, final_preds, pos_label=0):.4f}")
+    print(f"  Recall    (bad loan): {recall_score(y_arr, final_preds, pos_label=0):.4f}")
+    print(f"  F1        (bad loan): {f1_score(y_arr, final_preds, pos_label=0):.4f}")
+
+    # ------------------------------------------------------------------
+    # 11. Save artefacts:
+    #     - pd_model.sav            : plain sklearn LogisticRegression
+    #     - pd_model_features.pkl   : exact feature list the model expects
+    #     - pd_model_threshold.pkl  : optimal threshold as a plain float
+    #
+    #     Nothing custom is pickled — any script can load these without
+    #     importing any project-specific classes first.
     # ------------------------------------------------------------------
     with open(MODEL_SAVE_PATH, "wb") as f:
         pickle.dump(reg2_final.model, f)
-    print(f"\nModel successfully saved to: {MODEL_SAVE_PATH}")
+    print(f"\nModel saved to:     {MODEL_SAVE_PATH}")
 
     significant_features = reg2_final.feature_names_in_
     with open(FEATURES_SAVE_PATH, "wb") as f:
         pickle.dump(significant_features, f)
-    print(f"Feature list ({len(significant_features)} features) saved to: {FEATURES_SAVE_PATH}")
+    print(f"Feature list saved: {FEATURES_SAVE_PATH} ({len(significant_features)} features)")
+
+    with open(THRESHOLD_SAVE_PATH, "wb") as f:
+        pickle.dump(optimal_threshold, f)
+    print(f"Threshold saved:    {THRESHOLD_SAVE_PATH} (threshold = {optimal_threshold:.4f})")
 
 
 if __name__ == "__main__":

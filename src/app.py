@@ -11,6 +11,8 @@ from scipy.stats import norm as _norm
 
 sys.path.append(os.path.dirname(__file__))
 
+# Must import before unpickling — pickle needs to find these classes
+from model_classes import LogisticRegressionWithPValues, ThresholdClassifier  # noqa: F401
 from ETL import prepare_inputs
 from Scorecard import build_scorecard, calculate_credit_score, get_risk_tier, get_approval_decision
 
@@ -143,6 +145,15 @@ def load_lgd_model():
         return pickle.load(f)
 
 
+@st.cache_resource
+def load_threshold():
+    path = os.path.join(os.path.dirname(__file__), "pd_model_threshold.pkl")
+    if not os.path.exists(path):
+        return 0.5   # fall back to sklearn default if not found
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 # ---------------------------------------------------------------------------
 # Capital requirement helpers (Basel II IRB retail — §328)
 # ---------------------------------------------------------------------------
@@ -191,7 +202,8 @@ with st.sidebar:
         "EL = PD × LGD × EAD<br><br>"
         "LGD: 45% regulatory constant<br>"
         "EAD: funded_amnt − total_pymnt<br>"
-        "Score scale: 300–850 (ZA)"
+        "Score scale: 300–850 (ZA)<br>"
+        f"PD threshold: {load_threshold():.2f}"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -215,6 +227,7 @@ if page == "🔍 Applicant Assessment":
     model                = load_pd_model()
     significant_features = load_features()
     lgd_model            = load_lgd_model()
+    threshold            = load_threshold()
 
     if model is None:
         st.error("pd_model.sav not found. Run fit_model.py first.")
@@ -330,12 +343,17 @@ if page == "🔍 Applicant Assessment":
                     if col in X_prepared.columns:
                         X_final[col] = X_prepared[col].values[0]
 
-                X_arr  = X_final.values.astype(np.float64)
-                p_good = model.predict_proba(X_arr)[0][1]
-                pd_val = 1 - p_good    # PD = P(default)
-                el     = pd_val * lgd * ead
+                X_arr      = X_final.values.astype(np.float64)
+                proba_arr  = model.predict_proba(X_arr)[0]
+                p_good     = proba_arr[1]
+                pd_val     = 1 - p_good    # PD = P(default)
+                el         = pd_val * lgd * ead
 
-                # Absolute PDO credit score — decision driven by score
+                # Apply the saved optimal threshold (not sklearn default 0.5)
+                # 1 = good loan, 0 = default
+                model_decision = int(p_good >= threshold)
+
+                # Absolute PDO credit score — approval decision driven by score
                 credit_score = calculate_credit_score(
                     X_final, scorecard, base_points, min_score=300, max_score=850
                 )[0]
@@ -354,12 +372,14 @@ if page == "🔍 Applicant Assessment":
                 st.markdown("---")
                 st.markdown("### Assessment Results")
 
-                m1, m2, m3, m4, m5 = st.columns(5)
+                m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
                 m1.metric("Credit Score",        f"{credit_score}")
                 m2.metric("Risk Tier",           risk_tier.split(" - ")[0])
-                m3.metric("Default Probability", f"{pd_val:.2%}")
-                m4.metric("Expected Loss",       f"${el:,.0f}")
-                m5.metric("Decision",
+                m3.metric("PD",                  f"{pd_val:.2%}")
+                m4.metric("P(Good)",             f"{p_good:.2%}")
+                m5.metric("Expected Loss",       f"${el:,.0f}")
+                m6.metric("Model Threshold",     f"{threshold:.2f}")
+                m7.metric("Decision",
                           "✅ Approve" if decision == "Approve" else "❌ Decline")
 
                 # Gauge
