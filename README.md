@@ -1,11 +1,12 @@
 # Basel Credit Risk Model
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://tami-l-basel-credit-risk-model-srcapp-dbjaph.streamlit.app/)
+
 ## Overview
 
-This project implements a **credit risk modelling framework** based on Basel regulatory standards, focused on **Probability of Default (PD)** modelling using machine learning. It covers the full model lifecycle — ETL, training, validation, and scorecard generation — and is designed for **quantitative finance and risk management applications**.
+This project implements a **Basel II/III compliant credit risk modelling framework** built around the industry-standard **Weight of Evidence (WoE) / Information Value (IV)** methodology. It covers the full model lifecycle — ETL, WoE transformation, logistic regression training, scorecard generation, and a Streamlit dashboard — and is calibrated to the **South African credit market** using TransUnion SA / FICO Score 6 score bands (300–850) and NCR-aligned default rate assumptions.
 
-Key design decisions include handling of class imbalance (the dataset is ~89% good loans / 11% bad loans), statistically rigorous feature selection via p-value filtering, a shared feature-list artefact that keeps all downstream scripts in sync with the trained model, and a full Basel-compliant Expected Loss (EL = PD × LGD × EAD) computation pipeline.
+The pipeline is designed around two principles: regulatory defensibility (every transformation is auditable and monotonic) and production correctness (no post-origination data leaks into the model at any stage).
 
 ---
 
@@ -14,33 +15,44 @@ Key design decisions include handling of class imbalance (the dataset is ~89% go
 ```
 basel-credit-risk-model/
 ├── data/
-│   ├── loan_data_2007_2014.csv                            # Raw loan data (not versioned)
-│   ├── loan_data_inputs_train.csv                         # Preprocessed training features
-│   ├── loan_data_targets_train.csv                        # Training labels
-│   ├── loan_data_inputs_test.csv                          # Preprocessed test features
-│   ├── loan_data_targets_test.csv                         # Test labels
-│   ├── ead_train.csv                                      # EAD per loan — train split (generated)
-│   └── ead_test.csv                                       # EAD per loan — test split (generated)
+│   └── loan_data_2007_2014.csv          # Raw loan data (not versioned)
+├── scorecard_outputs/                   # Generated artefacts — re-run pipeline to regenerate
+│   ├── X_woe.csv                        # Full WoE-encoded dataset
+│   ├── y.csv                            # Binary target aligned to X_woe
+│   ├── woe_mappings.pkl                 # WoE bin definitions per feature
+│   ├── selected_features.pkl            # Features selected after IV + correlation filter
+│   ├── iv_summary.csv                   # IV per feature with band classification
+│   ├── model.pkl                        # Fitted LogisticRegression
+│   ├── feature_names.pkl                # Ordered feature list matching model.coef_
+│   ├── X_train.csv / X_test.csv         # Train/test WoE splits
+│   ├── y_train.csv / y_test.csv         # Train/test targets
+│   ├── cv_results.csv                   # Cross-validation AUC per C value
+│   ├── coef_summary.csv                 # Model coefficients sorted by magnitude
+│   ├── model_metrics.pkl                # Evaluation metrics for Streamlit app
+│   └── evaluation/                      # Plots and reports from evaluate.py
+│       ├── roc_curve.png
+│       ├── ks_chart.png
+│       ├── calibration_plot.png
+│       ├── confusion_matrix.png
+│       ├── precision_recall_bad.png
+│       ├── score_distribution.png
+│       ├── discrimination_metrics.csv
+│       ├── classification_report.csv
+│       ├── threshold_sweep.csv
+│       └── scorecard_points.csv
 ├── src/
-│   ├── __pycache__/                                       # Python bytecode cache (not versioned)
-│   ├── mlruns/                                            # MLflow experiment tracking data
-│   ├── app.py                                             # Application entry point
-│   ├── Credit Risk Modeling - Model Fitting.ipynb         # Model training notebook (original)
-│   ├── Credit Risk Modeling - Preparation.ipynb           # Data preparation notebook (original)
-│   ├── ETL.py                                             # ETL: feature engineering, EAD & train/test split
-│   ├── fit_model.py                                       # PD model training & MLflow experiment tracking
-│   ├── fit_lgd_model.py                                   # LGD model (Basel II constant, grade-segmented)
-│   ├── expected_loss.py                                   # EL = PD × LGD × EAD computation
-│   ├── mlflow.db                                          # MLflow tracking database
-│   ├── Model_Validation.py                                # Model validation & performance metrics
-│   ├── pd_model_features.pkl                              # Significant feature list (generated)
-│   ├── pd_model.sav                                       # Serialised final PD model (generated)
-│   ├── lgd_model.pkl                                      # Serialised LGD model (generated)
-│   ├── el_results.pkl                                     # Loan-level & portfolio EL results (generated)
-│   └── Scorecard.py                                       # Credit scorecard generation
+│   ├── mlruns/                          # MLflow experiment tracking data
+│   ├── app.py                           # Streamlit dashboard (3 pages)
+│   ├── woe_etl.py                       # WoE/IV ETL pipeline
+│   ├── train.py                         # Model training with MLflow tracking
+│   ├── evaluate.py                      # Model evaluation with threshold sweep
+│   ├── Scorecard.py                     # SA credit scorecard generation
+│   ├── fit_lgd_model.py                 # LGD model (Basel II constant, grade-segmented)
+│   ├── expected_loss.py                 # EL = PD × LGD × EAD computation
+│   ├── lgd_model.pkl                    # Serialised LGD model (generated)
+│   └── el_results.pkl                   # Loan-level & portfolio EL results (generated)
 ├── .gitignore
 ├── LICENSE
-├── mlflow.db                                              # MLflow tracking database (root)
 └── README.md
 ```
 
@@ -48,93 +60,102 @@ basel-credit-risk-model/
 
 ## Scripts
 
-### `ETL.py`
-Handles all data preparation before modelling:
-- Parses and engineers date, categorical, and continuous features (employment length, credit history age, interest rate bins, etc.)
-- One-hot encodes categorical columns, fitting the encoder on the **training set only** to prevent data leakage
-- Computes imputation statistics (e.g. mean annual income) from the training set and applies them to both splits
-- Computes **EAD = `funded_amnt` − `total_pymnt`** (floored at 0) from the raw data before splitting, then aligns to train/test indices
-- Saves six CSV artefacts to `data/`: inputs, targets, and EAD for both train and test splits
+### `woe_etl.py`
+The core data preparation pipeline. Takes raw loan data and produces a clean, WoE-encoded, model-ready dataset.
 
-### `app.py`
-Application entry point for the project.
+- Creates binary target: 0 = Bad (Charged Off, Default, Late 31–120 days), 1 = Good
+- Applies an **origination-time feature whitelist** — drops all post-origination columns (`last_pymnt_d`, `total_rec_prncp`, etc.) before any modelling begins, preventing data leakage
+- Bins numerical variables using **quantile binning** then enforces **monotonic default rates** per bin, merging bins until the relationship is directionally consistent — the core WoE pre-condition
+- Groups rare categorical levels (< 2% frequency) into `"Other"`; assigns `"Missing"` as its own bin for null values
+- Computes **WoE and IV** for every variable with Laplace smoothing to avoid ±inf from empty cells
+- Selects features using IV thresholds (drop < 0.02, keep ≥ 0.10) then removes correlated pairs (Spearman > 0.70), keeping the higher-IV feature
+- Replaces all feature values with their WoE equivalents — the final dataset contains no raw values
+- Saves all artefacts to `scorecard_outputs/` including `woe_mappings.pkl` for inference-time transformation
 
-### `fit_model.py`
-Trains three models and tracks experiments with MLflow:
-- **Logistic Regression** (sklearn) — baseline
-- **Random Forest** — tree-based comparison
-- **Logistic Regression with Wald-test p-values** — final model used for scorecard
+### `train.py`
+Trains a regularised logistic regression on the WoE-encoded features with full MLflow tracking.
 
-All models use `class_weight="balanced"` to address the ~8:1 class imbalance. Metrics reported include AUC, macro precision/recall/F1, and minority-class (bad loan) precision/recall/F1 separately.
+- Loads `X_woe.csv`, `y.csv`, and `selected_features.pkl` from `scorecard_outputs/`
+- Performs **stratified train/test split** (80/20) to preserve the 89/11 good/bad ratio
+- Uses `class_weight="balanced"` — the single most impactful change for recall on imbalanced credit data
+- Sweeps `C ∈ [0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0]` with 5-fold stratified CV scored on ROC-AUC; each C value is logged as a separate MLflow run
+- Fits the final model at the best C and logs it as a `best_model` run with the model artifact, coefficient table, and CV results attached
+- Saves `model.pkl`, `feature_names.pkl`, train/test splits, and `coef_summary.csv` to `scorecard_outputs/`
 
-After the initial fit, features with p-value > 0.05 are dropped and the model is refit on significant features only. The final model and its exact feature list are saved as `pd_model.sav` and `pd_model_features.pkl` respectively — ensuring all downstream scripts stay in sync automatically.
+### `evaluate.py`
+Evaluates the trained model with a focus on bad loan detection and threshold optimisation.
 
-Includes a cross-validated threshold optimisation step using `StratifiedKFold`.
-
-### `Model_Validation.py`
-Loads `pd_model.sav` and `pd_model_features.pkl` and evaluates the model on the held-out test set:
-- Confusion matrix (raw and normalised)
-- ROC curve and AUROC
-- Gini coefficient
-- Kolmogorov-Smirnov (KS) statistic and KS chart
-
-Feature selection is driven entirely by the saved `pd_model_features.pkl` — no hardcoded column lists.
+- Computes threshold-independent metrics: **ROC-AUC, Gini coefficient, KS statistic, PSI**
+- Runs a **threshold sweep** over `[0.3, 0.4, 0.5, 0.6, 0.7, 0.8]` — each threshold is logged as a separate MLflow run with recall, precision, F1, TP, FN, FP for the bad class
+- **Stops the sweep as soon as recall reaches 0.75** — pushing beyond this collapses precision and rejects too many good borrowers at an unacceptable rate; the target is configurable via `RECALL_TARGET`
+- Selects the best threshold as the first one that meets the recall target (most conservative among qualifying thresholds)
+- Saves `model_metrics.pkl` consumed by the Streamlit app, plus 6 plots and 4 CSV reports to `scorecard_outputs/evaluation/`
 
 ### `Scorecard.py`
-Converts the trained model's coefficients into an interpretable credit scorecard:
-- Uses the PDO (Points to Double Odds) scaling method
-- Outputs scores on a **300–850 South African credit scale**
-- Assigns risk tiers (Tier 1 Excellent → Tier 5 High Risk)
-- Validates the inverse relationship between score and predicted PD
-- Feature selection driven by `pd_model_features.pkl`
+Converts model coefficients into an interpretable credit scorecard calibrated to the South African market.
+
+- Uses the standard **PDO (Points to Double Odds)** scaling formula
+- Calibrated to SA market conditions: `PDO=20`, `base_odds=8:1` (~11% default rate, aligned with NCR data), `base_score=620`
+- Outputs scores on the **TransUnion SA / FICO Score 6 300–850 scale**
+- Applies official **TransUnion SA risk bands**: Excellent (767–850), Good (681–766), Favourable (614–680), Average (583–613), Below Average (527–582), Unfavourable (487–526), Poor (300–486)
+- Approval threshold set at **614 (bottom of Favourable)** with a "Refer" zone for borderline cases (604–613)
+- Includes NCA (National Credit Act) compliance note: score is one input only; affordability assessment required separately under Act 34 of 2005
+
+### `app.py`
+Streamlit dashboard with three pages.
+
+**Applicant Assessment** — takes raw loan application inputs, runs them through `transform_inference` (applies saved WoE mappings), scores with the logistic regression, and displays credit score, risk band, PD, EL, RWA, and Basel capital requirement for the individual loan. Decision shown as Approve / Refer / Decline based on TransUnion SA score bands.
+
+**Portfolio Dashboard** — loads `el_results.pkl` and displays portfolio-level EL, RWA, and capital requirement metrics with grade-level breakdowns and concentration curves.
+
+**Model Performance** — loads `model_metrics.pkl` and displays AUC, Gini, KS, PSI metric cards alongside the full threshold sweep chart and table showing how recall, precision and F1 for bad loans change as the threshold moves.
 
 ### `fit_lgd_model.py`
-Builds a grade-segmented Loss Given Default (LGD) model:
-- Applies the **Basel II regulatory constant of 45%** for unsecured retail exposures uniformly across all grades
-- Saves a grade-keyed lookup table as `lgd_model.pkl`
-- Structured so that per-grade values can be replaced with empirical recovery-rate estimates when recovery data becomes available — no downstream changes required
+Builds a grade-segmented LGD model applying the **Basel II regulatory constant of 45%** for unsecured retail exposures. Structured as a lookup table so empirical recovery-rate estimates can replace the constant later without downstream changes.
 
 ### `expected_loss.py`
-Combines PD, LGD, and EAD to compute Expected Loss at loan and portfolio level:
-- Loads `pd_model.sav`, `pd_model_features.pkl`, `lgd_model.pkl`, and `ead_test.csv`
-- Reconstructs raw grade labels from one-hot encoded inputs to look up LGD
-- Computes **EL = PD × LGD × EAD** for every loan
-- Outputs a loan-level DataFrame, a grade-level summary table, and scalar portfolio metrics (total EAD, total EL, EL rate, mean PD, high-risk loan share) saved together in `el_results.pkl`
+Computes **EL = PD × LGD × EAD** at loan and portfolio level, outputs grade-level summaries and saves `el_results.pkl` for the dashboard.
 
 ---
 
-## Key Design Decisions
+## Methodology: Why WoE/IV
 
-| Decision | Rationale |
-|---|---|
-| `class_weight="balanced"` on all models | Dataset is ~89% good / 11% bad; without weighting, models trivially predict "good" for everything |
-| P-value filtering (threshold = 0.05) | Removes statistically insignificant features after initial fit; model is refit on survivors |
-| `pd_model_features.pkl` shared artefact | Saves the exact post-filter, post-zero-variance-drop feature list so validation and scorecard scripts never go out of sync with the model |
-| OHE fitted on train only | Prevents test-set category distributions from leaking into the encoder |
-| `StratifiedKFold` for threshold optimisation | Preserves class distribution across folds given the imbalance |
-| EAD computed pre-split from raw data | Ensures EAD index stays aligned with train/test feature splits |
-| LGD structured as a lookup table | Basel II constant now; swappable for empirical estimates later without changing `expected_loss.py` |
-| `el_results.pkl` bundles loan + grade + portfolio | Single artefact gives the dashboard everything it needs in one load |
+The pipeline uses WoE/IV logistic regression rather than a raw-feature ML approach because this is a **Basel II IRB regulatory PD model**, not a pure predictive system.
+
+| Requirement | Raw ML approach | WoE/IV approach |
+|---|---|---|
+| SARB/PA regulatory acceptance | Difficult to defend | Standard — accepted methodology |
+| Interpretability | Low (many encoded columns) | High — each feature has a WoE table |
+| Monotonicity per feature | Not guaranteed | Enforced at binning stage |
+| Missing value handling | Ad-hoc imputation | Clean — Missing gets its own WoE bin |
+| PD calibration | Requires post-hoc calibration | Natively calibrated |
+| Scorecard conversion | Complex | Direct — coefficients → points |
+| NCA adverse action explainability | Difficult | Straightforward |
+
+---
+
+## South African Market Calibration
+
+| Parameter | Value | Basis |
+|---|---|---|
+| Score scale | 300–850 | FICO Score 6 / TransUnion SA standard |
+| Score bands | 7 bands (Poor → Excellent) | TransUnion SA official bands |
+| Base odds | 8:1 | ~11% default rate — NCR SA unsecured credit data |
+| PDO | 20 | Standard for high-default-rate unsecured markets |
+| Base score | 620 | Anchors 8:1 borrower at mid-Favourable tier |
+| Approval cut-off | 614 | Bottom of Favourable — SA lender convention |
+| Regulatory framework | NCA Act 34 of 2005 | Score is one input; affordability assessed separately |
 
 ---
 
 ## Installation
 
-1. Clone the repository:
 ```bash
 git clone https://github.com/Tami-L/basel-credit-risk-model.git
 cd basel-credit-risk-model
-```
-
-2. Create and activate a virtual environment:
-```bash
 python -m venv venv
 source venv/bin/activate        # macOS / Linux
 venv\Scripts\activate           # Windows
-```
-
-3. Install dependencies:
-```bash
 pip install -r requirements.txt
 ```
 
@@ -142,32 +163,55 @@ pip install -r requirements.txt
 
 ## Usage
 
-Run the scripts in order:
+Run the pipeline in order:
 
 ```bash
-# 1. Run ETL → writes train/test CSVs + EAD CSVs to data/
-python src/ETL.py
+# 1. WoE ETL → writes all artefacts to scorecard_outputs/
+python src/woe_etl.py
 
-# 2. Train PD model → writes pd_model.sav and pd_model_features.pkl to src/
-python src/fit_model.py
+# 2. Train model → writes model.pkl, feature_names.pkl, splits to scorecard_outputs/
+python src/train.py
 
-# 3. Build LGD model → writes lgd_model.pkl to src/
+# 3. Evaluate → writes model_metrics.pkl and evaluation/ reports to scorecard_outputs/
+python src/evaluate.py
+
+# 4. Build LGD model → writes lgd_model.pkl to src/
 python src/fit_lgd_model.py
 
-# 4. Compute Expected Loss → writes el_results.pkl to src/
+# 5. Compute Expected Loss → writes el_results.pkl to src/
 python src/expected_loss.py
 
-# 5. Validate PD model on test set
-python src/Model_Validation.py
-
-# 6. Generate scorecard
-python src/Scorecard.py
+# 6. Launch dashboard
+streamlit run src/app.py
 ```
 
-MLflow experiment results are written to `src/mlruns/`. Launch the MLflow UI with:
+Browse MLflow experiment results:
 ```bash
 mlflow ui --backend-store-uri src/mlruns
 ```
+
+The `credit_scorecard` experiment contains:
+- One run per C value from cross-validation (`cv_C=0.001` … `cv_C=10.0`)
+- One `best_model` run with the fitted model and coefficient table attached
+- One run per threshold from the evaluation sweep (`threshold=0.3` … up to the recall target)
+- One `evaluation_summary` run with all plots attached
+
+---
+
+## Key Design Decisions
+
+| Decision | Rationale |
+|---|---|
+| Origination-time feature whitelist | Drops post-origination columns (payment history, last payment date etc.) before binning — prevents leakage that inflated old model AUC |
+| WoE encoding replaces scaling | Compresses outliers, handles missing values, puts all features on a comparable log-odds scale — no separate normalisation needed |
+| Monotonic bin enforcement | Required for WoE validity; non-monotonic features produce unstable, non-interpretable coefficients |
+| `class_weight="balanced"` | 89/11 imbalance; without weighting the model learns to predict Good for everything and misses almost all defaults |
+| IV thresholds for feature selection | Drop < 0.02 (useless), keep ≥ 0.10 (strong); principled and auditable vs arbitrary manual selection |
+| Spearman correlation filter | Removes correlated pairs before fitting; correlated WoE features destabilise logistic regression coefficients |
+| Recall target of 0.75 | Pushing recall beyond 0.75 collapses precision — too many good borrowers rejected, violating NCA fairness obligations |
+| Stratified CV for C tuning | Preserves bad loan proportion across folds; without stratification, minority-class signal is uneven per fold |
+| SA base odds 8:1 | NCR data shows ~11% default rate in unsecured credit; 50:1 (old setting) implied ~2% which is wrong for this market |
+| `el_results.pkl` bundles loan + grade + portfolio | Single artefact gives the dashboard everything it needs in one load |
 
 ---
 
@@ -177,15 +221,16 @@ mlflow ui --backend-store-uri src/mlruns
 - pandas, numpy, scipy
 - scikit-learn
 - mlflow
-- matplotlib, seaborn
+- matplotlib
+- streamlit
+- plotly
 
 ---
 
 ## Notes
 
-- `pd_model.sav`, `pd_model_features.pkl`, `lgd_model.pkl`, and `el_results.pkl` are generated artefacts — they are not versioned and must be regenerated by running the pipeline in order
-- `ead_train.csv` and `ead_test.csv` in `data/` are also generated — re-run `ETL.py` to regenerate them
-- Raw loan data is not included in the repository due to size constraints
-- The scorecard uses South African credit bureau score ranges (300–850); these can be adjusted via constants at the top of `Scorecard.py`
-- `Credit Risk Modeling - Model Fitting.ipynb` and `Credit Risk Modeling - Preparation.ipynb` are the original exploratory notebooks; the production logic has been refactored into the `.py` scripts
-- `__pycache__/` and `mlruns/` are runtime-generated and should remain in `.gitignore`
+- All artefacts in `scorecard_outputs/` are generated — they are not versioned and must be rebuilt by running the pipeline in order
+- `lgd_model.pkl` and `el_results.pkl` in `src/` are also generated
+- Raw loan data is not included due to size — source from Lending Club / Kaggle
+- `woe_etl.py` exposes `transform_inference()` and `load_woe_artifacts()` for applying saved WoE mappings to new data at inference time without re-fitting
+- The recall target (0.75) and all SA scorecard parameters (PDO, base odds, bands) are defined as named constants at the top of their respective files and can be adjusted without touching the logic
