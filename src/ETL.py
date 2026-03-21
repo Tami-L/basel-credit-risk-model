@@ -1,511 +1,932 @@
+"""
+woe_etl.py
+==========
+Credit Scorecard ETL Pipeline — WoE / IV Edition
+-------------------------------------------------
+Transforms raw Lending Club loan data into a WoE-encoded, model-ready dataset
+for logistic regression scorecard development.
+
+Pipeline stages
+---------------
+1.  Data cleaning & target creation
+2.  Variable binning  (numerical → quantile / monotonic; categorical → grouped)
+3.  WoE & IV computation
+4.  Feature selection  (IV thresholds + correlation filter)
+5.  WoE transformation of the dataset
+6.  Artifact persistence
+7.  Output validation & reporting
+
+Does NOT train any model.
+Does NOT scale or normalise features (WoE replaces this).
+"""
+
+from __future__ import annotations
+
+import logging
+import pickle
+import warnings
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder
+from scipy.stats import spearmanr
 
+warnings.filterwarnings("ignore")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+TARGET_COL = "good_bad"
+REFERENCE_DATE = "2017-12-01"
+
+# IV thresholds
+IV_DROP_BELOW = 0.02        # useless predictors
+IV_WEAK_BELOW = 0.1         # flagged but optionally kept
+IV_STRONG_GTE = 0.1         # strong — always kept
+
+# Binning params
+DEFAULT_N_BINS = 10         # quantile bins before monotonicity merging
+MIN_BIN_OBS = 50            # minimum observations per bin (absolute)
+MIN_BIN_PCT = 0.05          # minimum observations per bin (fraction of total)
+RARE_CATEGORY_THRESHOLD = 0.02   # group categories below this frequency → "Other"
+
+# Correlation threshold
+CORR_THRESHOLD = 0.70
+
+# WoE clipping (avoid ±inf from empty event / non-event bins)
+WOE_CLIP = 3.0
+
+# Output directory — set OUTPUT_DIR to your preferred path before running
+OUTPUT_DIR = Path("scorecard_outputs")
+
+# ── Origination-time feature whitelist ────────────────────────────────────────
+# Only these columns are available at the time a loan application is submitted.
+# Post-origination columns (payment history, last_pymnt_d, total_rec_prncp etc.)
+# are excluded here to prevent data leakage into the scorecard model.
+# Under Basel II IRB and the SA NCA, a PD model must be based solely on
+# information available at origination.
+ORIGINATION_FEATURES = {
+    # Loan terms agreed at origination
+    "loan_amnt", "funded_amnt", "funded_amnt_inv", "term", "int_rate",
+    "installment", "grade", "sub_grade",
+    # Borrower profile at application
+    "emp_title", "emp_length", "home_ownership", "annual_inc",
+    "verification_status", "purpose", "title", "desc",
+    # Bureau / credit file at application
+    "dti", "delinq_2yrs", "inq_last_6mths", "mths_since_last_delinq",
+    "mths_since_last_record", "open_acc", "pub_rec", "revol_bal",
+    "revol_util", "total_acc", "initial_list_status",
+    "mths_since_last_major_derog", "collections_12_mths_ex_med",
+    "acc_now_delinq", "tot_coll_amt", "tot_cur_bal", "total_rev_hi_lim",
+    # Dates available at origination
+    "issue_d", "earliest_cr_line",
+    # Geography
+    "addr_state",
+}
+
+
+# ============================================================================
+# SECTION 1 — DATA LOADING & CLEANING
+# ============================================================================
 
 def load_data(path: str) -> pd.DataFrame:
-    return pd.read_csv(path, index_col=0, low_memory=False)
+    """Load raw CSV; expects an index column at position 0."""
+    log.info("Loading data from %s", path)
+    df = pd.read_csv(path, index_col=0, low_memory=False)
+    log.info("Loaded: %d rows × %d columns", *df.shape)
+    return df
 
 
-def _to_months_since(series: pd.Series, reference: pd.Timestamp) -> pd.Series:
-    return (reference.year - series.dt.year) * 12 + (reference.month - series.dt.month)
-
-
-def prepare_inputs(
-    df: pd.DataFrame,
-    reference_date: str = "2017-12-01",
-    target_col: Optional[str] = "good_bad",
-    ohe: Optional[OneHotEncoder] = None,
-    fit_ohe: bool = True,
-    train_params: Optional[Dict[str, Any]] = None,
-    fit_train_params: bool = True,
-) -> Tuple[pd.DataFrame, Optional[pd.Series], Optional[OneHotEncoder], Dict[str, Any]]:
+def create_target(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Prepare model inputs from raw DataFrame.
+    Derive binary target:  1 = Good (repaid),  0 = Bad (default / charged-off).
 
-    Parameters
-    ----------
-    df              : raw input DataFrame (may include target_col)
-    reference_date  : date used for months-since calculations
-    target_col      : name of the target column (set None if absent)
-    ohe             : a pre-fitted OneHotEncoder; required when fit_ohe=False
-    fit_ohe         : if True, fit a new OHE on this data; if False, use supplied ohe
-    train_params    : dict of statistics computed on the training set
-                      (annual_inc_mean, max_mths_issue_d, max_mths_earliest_cr_line).
-                      Must be supplied when fit_train_params=False.
-    fit_train_params: if True, compute and store those statistics from this data;
-                      if False, use values from train_params (for test/inference).
+    Bad statuses include Charged Off, Default, credit-policy violations, and
+    seriously delinquent accounts (31-120 days late).
+    """
+    bad_statuses = {
+        "Charged Off",
+        "Default",
+        "Does not meet the credit policy. Status:Charged Off",
+        "Late (31-120 days)",
+    }
+    df = df.copy()
+    df[TARGET_COL] = np.where(df["loan_status"].isin(bad_statuses), 0, 1)
+    n_bad  = (df[TARGET_COL] == 0).sum()
+    n_good = (df[TARGET_COL] == 1).sum()
+    log.info(
+        "Target created — Good: %d (%.1f%%)  Bad: %d (%.1f%%)",
+        n_good, 100 * n_good / len(df),
+        n_bad,  100 * n_bad  / len(df),
+    )
+    return df
 
-    Returns
-    -------
-    (X, y, ohe, train_params)
+
+def clean_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Perform light cleaning and return (feature_df, target_series).
+
+    •  Numeric columns: left as-is; missing values are handled at binning time
+       (they receive their own "Missing" bin).
+    •  Categorical columns: missing values filled with the string "Missing" so
+       they are treated as a distinct category.
+    •  Columns with > 95% missing are dropped entirely.
+    •  Constant columns are dropped.
+    •  The original loan_status column is dropped (it was used to build the target).
     """
     df = df.copy()
-    ref = pd.to_datetime(reference_date)
 
-    # ------------------------------------------------------------------ #
-    # 1. Date / string feature engineering                                 #
-    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ target
+    y = df[TARGET_COL].copy().astype(int)
+    assert set(y.unique()).issubset({0, 1}), "Target must be binary 0/1."
 
-    # emp_length -> emp_length_int
-    if "emp_length" in df.columns:
-        emp = df["emp_length"].astype(str).fillna("0")
-        emp = emp.str.replace(r"\+ years", "", regex=True)
-        emp = emp.str.replace("< 1 year", "0")
-        emp = emp.str.replace("n/a", "0")
-        emp = emp.str.replace(r" years", "", regex=True)
-        emp = emp.str.replace(r" year", "", regex=True)
-        emp = emp.str.replace(r"\+", "", regex=True)
-        emp_digits = emp.str.extract(r"(\d+)").fillna("0")[0]
-        df["emp_length_int"] = pd.to_numeric(emp_digits).astype(int)
+    # Drop target + source column so they never appear in features
+    cols_to_drop = [TARGET_COL, "loan_status"]
+    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
 
-    # earliest_cr_line -> months since
-    if "earliest_cr_line" in df.columns:
-        df["earliest_cr_line_date"] = pd.to_datetime(
-            df["earliest_cr_line"].astype(str).str.strip(), format="%b-%y", errors="coerce"
+    # --------------------------------------------------- drop near-empty columns
+    missing_rate = df.isnull().mean()
+    high_missing = missing_rate[missing_rate > 0.95].index.tolist()
+    if high_missing:
+        log.info("Dropping %d columns with >95%% missing: %s", len(high_missing), high_missing)
+    df = df.drop(columns=high_missing)
+
+    # --------------------------------------------------------- drop constants
+    nunique = df.nunique(dropna=False)
+    constant_cols = nunique[nunique <= 1].index.tolist()
+    if constant_cols:
+        log.info("Dropping %d constant columns: %s", len(constant_cols), constant_cols)
+    df = df.drop(columns=constant_cols)
+
+    # ─────────────── keep only origination-time features (no leakage) ──────────
+    available = [c for c in df.columns if c in ORIGINATION_FEATURES]
+    dropped_leakage = [c for c in df.columns if c not in ORIGINATION_FEATURES]
+    if dropped_leakage:
+        log.info(
+            "Dropping %d post-origination / leakage columns: %s",
+            len(dropped_leakage), dropped_leakage,
         )
-        today = pd.Timestamp.today()
-        mask = df["earliest_cr_line_date"] > today
-        df.loc[mask, "earliest_cr_line_date"] = (
-            df.loc[mask, "earliest_cr_line_date"] - pd.DateOffset(years=100)
+    df = df[available]
+
+    # --------------------------------- fill categorical NaN with "Missing" string
+    cat_cols = df.select_dtypes(include=["object", "category"]).columns
+    df[cat_cols] = df[cat_cols].fillna("Missing")
+
+    log.info("After cleaning: %d rows × %d features", *df.shape)
+    return df, y
+
+
+# ============================================================================
+# SECTION 2 — VARIABLE BINNING
+# ============================================================================
+
+def _coerce_numeric(series: pd.Series) -> pd.Series:
+    """Try to parse a column as numeric; return original if it fails."""
+    try:
+        return pd.to_numeric(series, errors="raise")
+    except (ValueError, TypeError):
+        return series
+
+
+def _group_rare_categories(series: pd.Series, threshold: float = RARE_CATEGORY_THRESHOLD) -> pd.Series:
+    """Replace infrequent categories (below threshold) with 'Other'."""
+    freq = series.value_counts(normalize=True, dropna=False)
+    rare = freq[freq < threshold].index
+    return series.where(~series.isin(rare), other="Other")
+
+
+def _quantile_bin(series: pd.Series, n_bins: int = DEFAULT_N_BINS) -> pd.Series:
+    """
+    Assign each observation to a quantile bin label (string).
+    Missing values are assigned to a dedicated "Missing" bin.
+    """
+    missing_mask = series.isnull()
+    result = pd.Series("Missing", index=series.index, dtype=object)
+
+    non_missing = series[~missing_mask]
+    if non_missing.nunique() <= 1:
+        result[~missing_mask] = "bin_0"
+        return result
+
+    # pd.qcut can fail with duplicate edges — fallback to fewer bins
+    for nb in range(n_bins, 1, -1):
+        try:
+            binned = pd.qcut(non_missing, q=nb, duplicates="drop", precision=4)
+            result[~missing_mask] = binned.astype(str)
+            return result
+        except Exception:
+            continue
+
+    # Last resort: single bin
+    result[~missing_mask] = "bin_0"
+    return result
+
+
+def _enforce_monotonic_bins(
+    series_binned: pd.Series,
+    y: pd.Series,
+    min_obs: int = MIN_BIN_OBS,
+    min_pct: float = MIN_BIN_PCT,
+) -> pd.Series:
+    """
+    Attempt to merge adjacent bins so the default rate is monotone.
+    Also merges bins that are too small.
+
+    Returns the (possibly merged) binned series.
+    """
+    df_tmp = pd.DataFrame({"bin": series_binned, "target": y})
+    non_missing_mask = series_binned != "Missing"
+    df_nm = df_tmp[non_missing_mask].copy()
+
+    if df_nm.empty:
+        return series_binned
+
+    stats = (
+        df_nm.groupby("bin", observed=True)["target"]
+        .agg(["count", "mean"])
+        .rename(columns={"mean": "bad_rate"})
+        .sort_index()
+    )
+
+    n_total = len(df_nm)
+
+    def _needs_merge(stats_df: pd.DataFrame) -> bool:
+        """Return True if any bin violates size or monotonicity."""
+        if len(stats_df) <= 1:
+            return False
+        too_small = (
+            (stats_df["count"] < min_obs) |
+            (stats_df["count"] / n_total < min_pct)
+        ).any()
+        if too_small:
+            return True
+        rates = stats_df["bad_rate"].values
+        diffs = np.diff(rates)
+        monotone_up   = (diffs >= 0).all()
+        monotone_down = (diffs <= 0).all()
+        return not (monotone_up or monotone_down)
+
+    max_passes = 20
+    for _ in range(max_passes):
+        if not _needs_merge(stats):
+            break
+
+        # Find the pair of adjacent bins with the smallest bad_rate difference
+        # and merge them
+        rates = stats["bad_rate"].values
+        idx   = stats.index.tolist()
+
+        if len(idx) < 2:
+            break
+
+        diffs = np.abs(np.diff(rates))
+        merge_pos = int(np.argmin(diffs))
+
+        old_bin = idx[merge_pos + 1]
+        new_bin = idx[merge_pos]
+
+        df_nm.loc[df_nm["bin"] == old_bin, "bin"] = new_bin
+
+        stats = (
+            df_nm.groupby("bin", observed=True)["target"]
+            .agg(["count", "mean"])
+            .rename(columns={"mean": "bad_rate"})
+            .sort_index()
         )
-        df["mths_since_earliest_cr_line"] = _to_months_since(df["earliest_cr_line_date"], ref)
 
-    # term -> term_int
-    if "term" in df.columns:
-        df["term_int"] = pd.to_numeric(
-            df["term"].astype(str).str.extract(r"(\d+)")[0], errors="coerce"
-        )
+    # Write merged labels back to the full series
+    result = series_binned.copy()
+    result[non_missing_mask] = df_nm["bin"]
+    return result
 
-    # issue_d -> months since
-    if "issue_d" in df.columns:
-        df["issue_d_date"] = pd.to_datetime(
-            df["issue_d"].astype(str).str.strip(), format="%b-%y", errors="coerce"
-        )
-        mask = df["issue_d_date"] > pd.Timestamp.today()
-        df.loc[mask, "issue_d_date"] = df.loc[mask, "issue_d_date"] - pd.DateOffset(years=100)
-        df["mths_since_issue_d"] = _to_months_since(df["issue_d_date"], ref)
 
-    # ------------------------------------------------------------------ #
-    # 2. Separate target                                                   #
-    # ------------------------------------------------------------------ #
-    y = None
-    if target_col and target_col in df.columns:
-        y = df[target_col].copy()
-        df = df.drop(columns=[target_col])
-
-    # ------------------------------------------------------------------ #
-    # 3. One-hot encoding                                                  #
-    # ------------------------------------------------------------------ #
-    to_encode = [
-        "grade", "sub_grade", "home_ownership", "verification_status",
-        "loan_status", "purpose", "addr_state", "initial_list_status",
-    ]
-    cat_cols = [col for col in to_encode if col in df.columns]
-
-    if cat_cols:
-        X_cat = df[cat_cols].astype(str)
-
-        if fit_ohe:
-            ohe = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-            ohe.fit(X_cat)
-
-        if ohe is not None:
-            feat_names = ohe.get_feature_names_out(cat_cols)
-            feat_names = [fn.replace("_", ":", 1) for fn in feat_names]
-            X_enc = pd.DataFrame(ohe.transform(X_cat), index=df.index, columns=feat_names)
-            df = pd.concat([df, X_enc], axis=1)
-
-    # ------------------------------------------------------------------ #
-    # 4. Compute / apply train statistics (no leakage)                     #
-    # ------------------------------------------------------------------ #
-    if fit_train_params:
-        train_params = {
-            "annual_inc_mean": (
-                df["annual_inc"].mean() if "annual_inc" in df.columns else 0.0
-            ),
-            "max_mths_issue_d": (
-                int(df["mths_since_issue_d"].dropna().max())
-                if "mths_since_issue_d" in df.columns and df["mths_since_issue_d"].notna().any()
-                else 0
-            ),
-            "max_mths_earliest_cr_line": (
-                int(df["mths_since_earliest_cr_line"].dropna().max())
-                if "mths_since_earliest_cr_line" in df.columns
-                and df["mths_since_earliest_cr_line"].notna().any()
-                else 0
-            ),
-        }
+def bin_variable(
+    series: pd.Series,
+    y: pd.Series,
+    is_numeric: bool,
+    n_bins: int = DEFAULT_N_BINS,
+) -> pd.Series:
+    """
+    Full binning pipeline for one variable.
+    Returns a Series of string bin labels.
+    """
+    if is_numeric:
+        binned = _quantile_bin(series, n_bins=n_bins)
+        binned = _enforce_monotonic_bins(binned, y)
     else:
-        # Validate that train_params was supplied
-        if train_params is None:
-            raise ValueError(
-                "train_params must be provided when fit_train_params=False "
-                "(i.e. when transforming the test set)."
-            )
+        binned = _group_rare_categories(series.astype(str)).astype(str)
 
-    annual_inc_mean = train_params["annual_inc_mean"]
-    max_mths_issue_d = train_params["max_mths_issue_d"]
-    max_mths_earliest_cr_line = train_params["max_mths_earliest_cr_line"]
-
-    # ------------------------------------------------------------------ #
-    # 5. Fill missing values using TRAIN statistics                        #
-    # ------------------------------------------------------------------ #
-    if "total_rev_hi_lim" in df.columns and "funded_amnt" in df.columns:
-        df["total_rev_hi_lim"] = df["total_rev_hi_lim"].fillna(df["funded_amnt"])
-    if "annual_inc" in df.columns:
-        df["annual_inc"] = df["annual_inc"].fillna(annual_inc_mean)  # train mean only
-    for c in [
-        "mths_since_earliest_cr_line", "acc_now_delinq", "total_acc",
-        "pub_rec", "open_acc", "inq_last_6mths", "delinq_2yrs", "emp_length_int",
-    ]:
-        if c in df.columns:
-            df[c] = df[c].fillna(0)
-
-    # ------------------------------------------------------------------ #
-    # 6. Combined / grouped dummy features                                 #
-    # ------------------------------------------------------------------ #
-
-    # home_ownership grouping
-    ho_cols = [f"home_ownership:{v}" for v in ("RENT", "OTHER", "NONE", "ANY", "OWN", "MORTGAGE")]
-    existing_ho = [c for c in ho_cols if c in df.columns]
-    if existing_ho:
-        df["home_ownership:RENT_OTHER_NONE_ANY"] = df[
-            [f"home_ownership:{v}" for v in ("RENT", "OTHER", "NONE", "ANY") if f"home_ownership:{v}" in df.columns]
-        ].sum(axis=1)
-    else:
-        df["home_ownership:RENT_OTHER_NONE_ANY"] = 0
-
-    for ho in ["OWN", "MORTGAGE"]:
-        col = f"home_ownership:{ho}"
-        if col not in df.columns:
-            df[col] = 0
-
-    # addr_state dummies
-    addr_states = [
-        "ND", "NE", "IA", "NV", "FL", "HI", "AL", "NM", "VA", "OK", "TN", "MO", "LA",
-        "MD", "NC", "UT", "KY", "AZ", "NJ", "AR", "MI", "PA", "OH", "MN", "RI", "MA",
-        "DE", "SD", "IN", "GA", "WA", "OR", "WI", "MT", "IL", "CT", "KS", "SC", "CO",
-        "VT", "AK", "MS", "WV", "NH", "WY", "DC", "ME", "ID", "NY", "CA", "TX",
-    ]
-    for s in addr_states:
-        col = f"addr_state:{s}"
-        if col not in df.columns:
-            df[col] = 0
-
-    df["addr_state:ND_NE_IA_NV_FL_HI_AL"] = df[["addr_state:ND", "addr_state:NE", "addr_state:IA", "addr_state:NV", "addr_state:FL", "addr_state:HI", "addr_state:AL"]].sum(axis=1)
-    df["addr_state:NM_VA"] = df[["addr_state:NM", "addr_state:VA"]].sum(axis=1)
-    df["addr_state:OK_TN_MO_LA_MD_NC"] = df[["addr_state:OK", "addr_state:TN", "addr_state:MO", "addr_state:LA", "addr_state:MD", "addr_state:NC"]].sum(axis=1)
-    df["addr_state:UT_KY_AZ_NJ"] = df[["addr_state:UT", "addr_state:KY", "addr_state:AZ", "addr_state:NJ"]].sum(axis=1)
-    df["addr_state:AR_MI_PA_OH_MN"] = df[["addr_state:AR", "addr_state:MI", "addr_state:PA", "addr_state:OH", "addr_state:MN"]].sum(axis=1)
-    df["addr_state:RI_MA_DE_SD_IN"] = df[["addr_state:RI", "addr_state:MA", "addr_state:DE", "addr_state:SD", "addr_state:IN"]].sum(axis=1)
-    df["addr_state:GA_WA_OR"] = df[["addr_state:GA", "addr_state:WA", "addr_state:OR"]].sum(axis=1)
-    df["addr_state:WI_MT"] = df[["addr_state:WI", "addr_state:MT"]].sum(axis=1)
-    df["addr_state:IL_CT"] = df[["addr_state:IL", "addr_state:CT"]].sum(axis=1)
-    df["addr_state:KS_SC_CO_VT_AK_MS"] = df[["addr_state:KS", "addr_state:SC", "addr_state:CO", "addr_state:VT", "addr_state:AK", "addr_state:MS"]].sum(axis=1)
-    df["addr_state:WV_NH_WY_DC_ME_ID"] = df[["addr_state:WV", "addr_state:NH", "addr_state:WY", "addr_state:DC", "addr_state:ME", "addr_state:ID"]].sum(axis=1)
-
-    # verification_status dummies
-    for status in ["Not Verified", "Source Verified", "Verified"]:
-        col = f"verification_status:{status}"
-        if col not in df.columns:
-            df[col] = 0
-
-    # initial_list_status dummies
-    for status in ["f", "w"]:
-        col = f"initial_list_status:{status}"
-        if col not in df.columns:
-            df[col] = 0
-
-    # purpose groupings
-    purpose_groups = {
-        "purpose:educ__sm_b__wedd__ren_en__mov__house": [
-            "educational", "small_business", "wedding", "renewable_energy", "moving", "house"
-        ],
-        "purpose:oth__med__vacation": ["other", "medical", "vacation"],
-        "purpose:major_purch__car__home_impr": ["major_purchase", "car", "home_improvement"],
-    }
-    for group, cats in purpose_groups.items():
-        cols = [f"purpose:{c}" for c in cats]
-        existing = [c for c in cols if c in df.columns]
-        df[group] = df[existing].sum(axis=1) if existing else 0
-
-    # ------------------------------------------------------------------ #
-    # 7. Binary / bucketed features                                        #
-    # ------------------------------------------------------------------ #
-
-    # term
-    if "term_int" in df.columns:
-        df["term:36"] = np.where(df["term_int"] == 36, 1, 0)
-        df["term:60"] = np.where(df["term_int"] == 60, 1, 0)
-
-    # emp_length bins
-    if "emp_length_int" in df.columns:
-        df["emp_length:0"] = np.where(df["emp_length_int"].isin([0]), 1, 0)
-        df["emp_length:1"] = np.where(df["emp_length_int"].isin([1]), 1, 0)
-        df["emp_length:2-4"] = np.where(df["emp_length_int"].isin(range(2, 5)), 1, 0)
-        df["emp_length:5-6"] = np.where(df["emp_length_int"].isin(range(5, 7)), 1, 0)
-        df["emp_length:7-9"] = np.where(df["emp_length_int"].isin(range(7, 10)), 1, 0)
-        df["emp_length:10"] = np.where(df["emp_length_int"].isin([10]), 1, 0)
-
-    # mths_since_issue_d buckets — use TRAIN max
-    if "mths_since_issue_d" in df.columns:
-        max_m = max_mths_issue_d
-        df["mths_since_issue_d:<38"] = np.where(df["mths_since_issue_d"].isin(range(38)), 1, 0)
-        df["mths_since_issue_d:38-39"] = np.where(df["mths_since_issue_d"].isin(range(38, 40)), 1, 0)
-        df["mths_since_issue_d:40-41"] = np.where(df["mths_since_issue_d"].isin(range(40, 42)), 1, 0)
-        df["mths_since_issue_d:42-48"] = np.where(df["mths_since_issue_d"].isin(range(42, 49)), 1, 0)
-        df["mths_since_issue_d:49-52"] = np.where(df["mths_since_issue_d"].isin(range(49, 53)), 1, 0)
-        df["mths_since_issue_d:53-64"] = np.where(df["mths_since_issue_d"].isin(range(53, 65)), 1, 0)
-        df["mths_since_issue_d:65-84"] = np.where(df["mths_since_issue_d"].isin(range(65, 85)), 1, 0)
-        df["mths_since_issue_d:>84"] = np.where(df["mths_since_issue_d"].isin(range(85, max_m + 1)), 1, 0)
-
-    # int_rate bins
-    if "int_rate" in df.columns:
-        df["int_rate:<9.548"] = np.where(df["int_rate"] <= 9.548, 1, 0)
-        df["int_rate:9.548-12.025"] = np.where((df["int_rate"] > 9.548) & (df["int_rate"] <= 12.025), 1, 0)
-        df["int_rate:12.025-15.74"] = np.where((df["int_rate"] > 12.025) & (df["int_rate"] <= 15.74), 1, 0)
-        df["int_rate:15.74-20.281"] = np.where((df["int_rate"] > 15.74) & (df["int_rate"] <= 20.281), 1, 0)
-        df["int_rate:>20.281"] = np.where(df["int_rate"] > 20.281, 1, 0)
-
-    # funded_amnt_factor
-    if "funded_amnt" in df.columns:
-        df["funded_amnt_factor"] = pd.cut(df["funded_amnt"], 50)
-
-    # mths_since_earliest_cr_line buckets — use TRAIN max
-    if "mths_since_earliest_cr_line" in df.columns:
-        max_m = max_mths_earliest_cr_line
-        df["mths_since_earliest_cr_line:<140"] = np.where(df["mths_since_earliest_cr_line"].isin(range(140)), 1, 0)
-        df["mths_since_earliest_cr_line:141-164"] = np.where(df["mths_since_earliest_cr_line"].isin(range(140, 165)), 1, 0)
-        df["mths_since_earliest_cr_line:165-247"] = np.where(df["mths_since_earliest_cr_line"].isin(range(165, 248)), 1, 0)
-        df["mths_since_earliest_cr_line:248-270"] = np.where(df["mths_since_earliest_cr_line"].isin(range(248, 271)), 1, 0)
-        df["mths_since_earliest_cr_line:271-352"] = np.where(df["mths_since_earliest_cr_line"].isin(range(271, 353)), 1, 0)
-        df["mths_since_earliest_cr_line:>352"] = np.where(df["mths_since_earliest_cr_line"].isin(range(353, max_m + 1)), 1, 0)
-
-    # delinq_2yrs bins
-    if "delinq_2yrs" in df.columns:
-        df["delinq_2yrs:0"] = np.where(df["delinq_2yrs"] == 0, 1, 0)
-        df["delinq_2yrs:1-3"] = np.where((df["delinq_2yrs"] >= 1) & (df["delinq_2yrs"] <= 3), 1, 0)
-        df["delinq_2yrs:>=4"] = np.where(df["delinq_2yrs"] >= 4, 1, 0)
-
-    # inq_last_6mths bins
-    if "inq_last_6mths" in df.columns:
-        df["inq_last_6mths:0"] = np.where(df["inq_last_6mths"] == 0, 1, 0)
-        df["inq_last_6mths:1-2"] = np.where((df["inq_last_6mths"] >= 1) & (df["inq_last_6mths"] <= 2), 1, 0)
-        df["inq_last_6mths:3-6"] = np.where((df["inq_last_6mths"] >= 3) & (df["inq_last_6mths"] <= 6), 1, 0)
-        df["inq_last_6mths:>6"] = np.where(df["inq_last_6mths"] > 6, 1, 0)
-
-    # open_acc bins
-    if "open_acc" in df.columns:
-        df["open_acc:0"] = np.where(df["open_acc"] == 0, 1, 0)
-        df["open_acc:1-3"] = np.where((df["open_acc"] >= 1) & (df["open_acc"] <= 3), 1, 0)
-        df["open_acc:4-12"] = np.where((df["open_acc"] >= 4) & (df["open_acc"] <= 12), 1, 0)
-        df["open_acc:13-17"] = np.where((df["open_acc"] >= 13) & (df["open_acc"] <= 17), 1, 0)
-        df["open_acc:18-22"] = np.where((df["open_acc"] >= 18) & (df["open_acc"] <= 22), 1, 0)
-        df["open_acc:23-25"] = np.where((df["open_acc"] >= 23) & (df["open_acc"] <= 25), 1, 0)
-        df["open_acc:26-30"] = np.where((df["open_acc"] >= 26) & (df["open_acc"] <= 30), 1, 0)
-        df["open_acc:>=31"] = np.where(df["open_acc"] >= 31, 1, 0)
-
-    # pub_rec bins
-    if "pub_rec" in df.columns:
-        df["pub_rec:0-2"] = np.where((df["pub_rec"] >= 0) & (df["pub_rec"] <= 2), 1, 0)
-        df["pub_rec:3-4"] = np.where((df["pub_rec"] >= 3) & (df["pub_rec"] <= 4), 1, 0)
-        df["pub_rec:>=5"] = np.where(df["pub_rec"] >= 5, 1, 0)
-
-    # total_acc bins
-    if "total_acc" in df.columns:
-        df["total_acc:<=27"] = np.where(df["total_acc"] <= 27, 1, 0)
-        df["total_acc:28-51"] = np.where((df["total_acc"] >= 28) & (df["total_acc"] <= 51), 1, 0)
-        df["total_acc:>=52"] = np.where(df["total_acc"] >= 52, 1, 0)
-
-    # acc_now_delinq bins
-    if "acc_now_delinq" in df.columns:
-        df["acc_now_delinq:0"] = np.where(df["acc_now_delinq"] == 0, 1, 0)
-        df["acc_now_delinq:>=1"] = np.where(df["acc_now_delinq"] >= 1, 1, 0)
-
-    # total_rev_hi_lim bins
-    if "total_rev_hi_lim" in df.columns:
-        df["total_rev_hi_lim:<=5K"] = np.where(df["total_rev_hi_lim"] <= 5000, 1, 0)
-        df["total_rev_hi_lim:5K-10K"] = np.where((df["total_rev_hi_lim"] > 5000) & (df["total_rev_hi_lim"] <= 10000), 1, 0)
-        df["total_rev_hi_lim:10K-20K"] = np.where((df["total_rev_hi_lim"] > 10000) & (df["total_rev_hi_lim"] <= 20000), 1, 0)
-        df["total_rev_hi_lim:20K-30K"] = np.where((df["total_rev_hi_lim"] > 20000) & (df["total_rev_hi_lim"] <= 30000), 1, 0)
-        df["total_rev_hi_lim:30K-40K"] = np.where((df["total_rev_hi_lim"] > 30000) & (df["total_rev_hi_lim"] <= 40000), 1, 0)
-        df["total_rev_hi_lim:40K-55K"] = np.where((df["total_rev_hi_lim"] > 40000) & (df["total_rev_hi_lim"] <= 55000), 1, 0)
-        df["total_rev_hi_lim:55K-95K"] = np.where((df["total_rev_hi_lim"] > 55000) & (df["total_rev_hi_lim"] <= 95000), 1, 0)
-        df["total_rev_hi_lim:>95K"] = np.where(df["total_rev_hi_lim"] > 95000, 1, 0)
-
-    # installment_factor and annual_inc bins
-    if "installment" in df.columns:
-        df["installment_factor"] = pd.cut(df["installment"], 50)
-    if "annual_inc" in df.columns:
-        df["annual_inc:<20K"] = np.where(df["annual_inc"] <= 20000, 1, 0)
-        df["annual_inc:20K-30K"] = np.where((df["annual_inc"] > 20000) & (df["annual_inc"] <= 30000), 1, 0)
-        df["annual_inc:30K-40K"] = np.where((df["annual_inc"] > 30000) & (df["annual_inc"] <= 40000), 1, 0)
-        df["annual_inc:40K-50K"] = np.where((df["annual_inc"] > 40000) & (df["annual_inc"] <= 50000), 1, 0)
-        df["annual_inc:50K-60K"] = np.where((df["annual_inc"] > 50000) & (df["annual_inc"] <= 60000), 1, 0)
-        df["annual_inc:60K-70K"] = np.where((df["annual_inc"] > 60000) & (df["annual_inc"] <= 70000), 1, 0)
-        df["annual_inc:70K-80K"] = np.where((df["annual_inc"] > 70000) & (df["annual_inc"] <= 80000), 1, 0)
-        df["annual_inc:80K-90K"] = np.where((df["annual_inc"] > 80000) & (df["annual_inc"] <= 90000), 1, 0)
-        df["annual_inc:90K-100K"] = np.where((df["annual_inc"] > 90000) & (df["annual_inc"] <= 100000), 1, 0)
-        df["annual_inc:100K-120K"] = np.where((df["annual_inc"] > 100000) & (df["annual_inc"] <= 120000), 1, 0)
-        df["annual_inc:120K-140K"] = np.where((df["annual_inc"] > 120000) & (df["annual_inc"] <= 140000), 1, 0)
-        df["annual_inc:>140K"] = np.where(df["annual_inc"] > 140000, 1, 0)
-
-    # mths_since_last_delinq bins including Missing
-    if "mths_since_last_delinq" in df.columns:
-        df["mths_since_last_delinq:Missing"] = np.where(df["mths_since_last_delinq"].isnull(), 1, 0)
-        df["mths_since_last_delinq:0-3"] = np.where((df["mths_since_last_delinq"] >= 0) & (df["mths_since_last_delinq"] <= 3), 1, 0)
-        df["mths_since_last_delinq:4-30"] = np.where((df["mths_since_last_delinq"] >= 4) & (df["mths_since_last_delinq"] <= 30), 1, 0)
-        df["mths_since_last_delinq:31-56"] = np.where((df["mths_since_last_delinq"] >= 31) & (df["mths_since_last_delinq"] <= 56), 1, 0)
-        df["mths_since_last_delinq:>=57"] = np.where(df["mths_since_last_delinq"] >= 57, 1, 0)
-
-    # dti bins
-    if "dti" in df.columns:
-        df["dti:<=1.4"] = np.where(df["dti"] <= 1.4, 1, 0)
-        df["dti:1.4-3.5"] = np.where((df["dti"] > 1.4) & (df["dti"] <= 3.5), 1, 0)
-        df["dti:3.5-7.7"] = np.where((df["dti"] > 3.5) & (df["dti"] <= 7.7), 1, 0)
-        df["dti:7.7-10.5"] = np.where((df["dti"] > 7.7) & (df["dti"] <= 10.5), 1, 0)
-        df["dti:10.5-16.1"] = np.where((df["dti"] > 10.5) & (df["dti"] <= 16.1), 1, 0)
-        df["dti:16.1-20.3"] = np.where((df["dti"] > 16.1) & (df["dti"] <= 20.3), 1, 0)
-        df["dti:20.3-21.7"] = np.where((df["dti"] > 20.3) & (df["dti"] <= 21.7), 1, 0)
-        df["dti:21.7-22.4"] = np.where((df["dti"] > 21.7) & (df["dti"] <= 22.4), 1, 0)
-        df["dti:22.4-35"] = np.where((df["dti"] > 22.4) & (df["dti"] <= 35), 1, 0)
-        df["dti:>35"] = np.where(df["dti"] > 35, 1, 0)
-
-    # mths_since_last_record bins
-    if "mths_since_last_record" in df.columns:
-        df["mths_since_last_record:Missing"] = np.where(df["mths_since_last_record"].isnull(), 1, 0)
-        df["mths_since_last_record:0-2"] = np.where((df["mths_since_last_record"] >= 0) & (df["mths_since_last_record"] <= 2), 1, 0)
-        df["mths_since_last_record:3-20"] = np.where((df["mths_since_last_record"] >= 3) & (df["mths_since_last_record"] <= 20), 1, 0)
-        df["mths_since_last_record:21-31"] = np.where((df["mths_since_last_record"] >= 21) & (df["mths_since_last_record"] <= 31), 1, 0)
-        df["mths_since_last_record:32-80"] = np.where((df["mths_since_last_record"] >= 32) & (df["mths_since_last_record"] <= 80), 1, 0)
-        df["mths_since_last_record:81-86"] = np.where((df["mths_since_last_record"] >= 81) & (df["mths_since_last_record"] <= 86), 1, 0)
-        df["mths_since_last_record:>=86"] = np.where(df["mths_since_last_record"] >= 86, 1, 0)
-
-    return df, y, ohe, train_params
+    return binned
 
 
-def split_and_prepare(
-    df: pd.DataFrame,
-    test_size: float = 0.2,
-    random_state: int = 42,
-    reference_date: str = "2017-12-01",
-) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+def bin_all_variables(
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> tuple[pd.DataFrame, dict[str, bool]]:
     """
-    Split raw data into train/test and apply consistent preprocessing.
-
-    - OHE is fit on train only, then applied to test.
-    - annual_inc mean and max_m bucket boundaries are computed from train only.
-    - No test-set information leaks into the train pipeline.
-    """
-    df["good_bad"] = np.where(
-        df["loan_status"].isin([
-            "Charged Off", "Default",
-            "Does not meet the credit policy. Status:Charged Off",
-            "Late (31-120 days)",
-        ]),
-        0, 1,
-    )
-
-    X = df.drop(columns=["good_bad"])
-    y = df["good_bad"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
-    )
-
-    # ---- Fit ALL transformers on TRAIN only --------------------------------
-    train_df = pd.concat([X_train, y_train.rename("good_bad")], axis=1)
-    X_train_prep, y_train_prep, ohe, train_params = prepare_inputs(
-        train_df,
-        reference_date=reference_date,
-        target_col="good_bad",
-        fit_ohe=True,
-        fit_train_params=True,
-    )
-
-    # ---- Apply (transform only) to TEST ------------------------------------
-    test_df = pd.concat([X_test, y_test.rename("good_bad")], axis=1)
-    X_test_prep, y_test_prep, _, _ = prepare_inputs(
-        test_df,
-        reference_date=reference_date,
-        target_col="good_bad",
-        ohe=ohe,                   
-        fit_ohe=False,
-        train_params=train_params,  
-        fit_train_params=False,
-    )
-
-    return X_train_prep, y_train_prep, X_test_prep, y_test_prep
-
-
-def compute_ead(df_raw: pd.DataFrame) -> pd.Series:
-    """
-    Compute Exposure at Default (EAD) as outstanding balance.
-
-    EAD = funded_amnt - total_pymnt, floored at 0.
-    A negative value would mean the borrower has overpaid (edge case),
-    so we clip to 0.
-
-    Parameters
-    ----------
-    df_raw : raw loan DataFrame containing funded_amnt and total_pymnt
+    Bin every column in X.
 
     Returns
     -------
-    pd.Series of EAD values, indexed to match df_raw
+    X_binned   : DataFrame of string bin labels
+    is_numeric : dict mapping column name → True if numeric
     """
-    if "funded_amnt" not in df_raw.columns or "total_pymnt" not in df_raw.columns:
-        raise ValueError(
-            "Raw data must contain 'funded_amnt' and 'total_pymnt' to compute EAD."
+    X_binned   = pd.DataFrame(index=X.index)
+    is_numeric: dict[str, bool] = {}
+
+    for col in X.columns:
+        series = _coerce_numeric(X[col])
+        numeric = pd.api.types.is_numeric_dtype(series)
+        is_numeric[col] = numeric
+        X_binned[col] = bin_variable(series, y, is_numeric=numeric)
+
+    log.info("Binning complete: %d variables processed", len(X.columns))
+    return X_binned, is_numeric
+
+
+# ============================================================================
+# SECTION 3 — WoE & IV COMPUTATION
+# ============================================================================
+
+def compute_woe_iv(
+    binned_series: pd.Series,
+    y: pd.Series,
+) -> tuple[pd.DataFrame, float]:
+    """
+    Compute WoE and IV for a single binned variable.
+
+    Convention used here:
+        y = 1  →  Good  (non-default)
+        y = 0  →  Bad   (default)
+
+    WoE_bin = ln( P(Good | bin) / P(Bad | bin) )
+            = ln( (n_good_bin / N_good) / (n_bad_bin / N_bad) )
+
+    IV = Σ  (pct_good_bin − pct_bad_bin) × WoE_bin
+
+    Returns
+    -------
+    woe_table : DataFrame with columns [bin, n_obs, n_good, n_bad,
+                                        pct_good, pct_bad, woe, iv_contrib]
+    iv        : float — total Information Value for the variable
+    """
+    df = pd.DataFrame({"bin": binned_series, "target": y})
+    stats = (
+        df.groupby("bin", observed=True)["target"]
+        .agg(
+            n_obs="count",
+            n_good=lambda s: (s == 1).sum(),
+            n_bad =lambda s: (s == 0).sum(),
         )
-    ead = (df_raw["funded_amnt"] - df_raw["total_pymnt"]).clip(lower=0)
-    return ead.rename("ead")
+        .reset_index()
+    )
+
+    n_good_total = max((y == 1).sum(), 1)
+    n_bad_total  = max((y == 0).sum(), 1)
+
+    # Add small epsilon to avoid log(0)
+    eps = 0.5
+    stats["pct_good"] = (stats["n_good"] + eps) / (n_good_total + eps * len(stats))
+    stats["pct_bad"]  = (stats["n_bad"]  + eps) / (n_bad_total  + eps * len(stats))
+
+    stats["woe"] = np.log(stats["pct_good"] / stats["pct_bad"]).clip(-WOE_CLIP, WOE_CLIP)
+    stats["iv_contrib"] = (stats["pct_good"] - stats["pct_bad"]) * stats["woe"]
+
+    iv = stats["iv_contrib"].sum()
+    return stats, iv
 
 
-def save_outputs(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    out_dir: str,
-    ead_train: Optional[pd.Series] = None,
-    ead_test: Optional[pd.Series] = None,
-):
-    p = Path(out_dir)
-    p.mkdir(parents=True, exist_ok=True)
-    X_train.to_csv(p / "loan_data_inputs_train.csv", index=False)
-    y_train.to_csv(p / "loan_data_targets_train.csv", index=False)
-    X_test.to_csv(p / "loan_data_inputs_test.csv", index=False)
-    y_test.to_csv(p / "loan_data_targets_test.csv", index=False)
-    if ead_train is not None:
-        ead_train.to_csv(p / "ead_train.csv", index=False)
-        print(f"EAD train saved: {len(ead_train)} rows")
-    if ead_test is not None:
-        ead_test.to_csv(p / "ead_test.csv", index=False)
-        print(f"EAD test  saved: {len(ead_test)} rows")
+def compute_all_woe_iv(
+    X_binned: pd.DataFrame,
+    y: pd.Series,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    Run WoE / IV computation for every variable.
 
+    Returns
+    -------
+    woe_tables : {col: woe_table DataFrame}
+    iv_summary : DataFrame[feature, iv]  sorted descending
+    """
+    woe_tables: dict[str, pd.DataFrame] = {}
+    iv_records: list[dict] = []
+
+    for col in X_binned.columns:
+        tbl, iv = compute_woe_iv(X_binned[col], y)
+        tbl.insert(0, "feature", col)
+        woe_tables[col] = tbl
+        iv_records.append({"feature": col, "iv": round(iv, 6)})
+
+    iv_summary = (
+        pd.DataFrame(iv_records)
+        .sort_values("iv", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    log.info("WoE / IV computed for %d variables", len(iv_summary))
+    return woe_tables, iv_summary
+
+
+# ============================================================================
+# SECTION 4 — FEATURE SELECTION
+# ============================================================================
+
+def _iv_selection(
+    iv_summary: pd.DataFrame,
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Split features into three groups based on IV thresholds.
+
+    Returns
+    -------
+    strong_features : IV >= 0.1
+    weak_features   : 0.02 <= IV < 0.1  (flagged, optionally kept)
+    dropped_features: IV < 0.02
+    """
+    strong   = iv_summary[iv_summary["iv"] >= IV_STRONG_GTE]["feature"].tolist()
+    weak     = iv_summary[
+        (iv_summary["iv"] >= IV_DROP_BELOW) & (iv_summary["iv"] < IV_STRONG_GTE)
+    ]["feature"].tolist()
+    dropped  = iv_summary[iv_summary["iv"] < IV_DROP_BELOW]["feature"].tolist()
+    return strong, weak, dropped
+
+
+def _correlation_filter(
+    X_woe_candidate: pd.DataFrame,
+    iv_summary: pd.DataFrame,
+    threshold: float = CORR_THRESHOLD,
+) -> list[str]:
+    """
+    Remove correlated features, keeping the one with higher IV.
+
+    Uses Spearman rank correlation on the WoE-encoded values.
+    Returns the list of features to keep.
+    """
+    iv_map = iv_summary.set_index("feature")["iv"].to_dict()
+    features = X_woe_candidate.columns.tolist()
+
+    if len(features) < 2:
+        return features
+
+    corr_matrix = X_woe_candidate.corr(method="spearman").abs()
+
+    to_drop: set[str] = set()
+    for i, fi in enumerate(features):
+        if fi in to_drop:
+            continue
+        for fj in features[i + 1:]:
+            if fj in to_drop:
+                continue
+            if corr_matrix.loc[fi, fj] > threshold:
+                # Drop the one with lower IV
+                iv_i = iv_map.get(fi, 0)
+                iv_j = iv_map.get(fj, 0)
+                drop_col = fj if iv_i >= iv_j else fi
+                to_drop.add(drop_col)
+                log.debug(
+                    "Corr(%.2f) between %s and %s → dropping %s",
+                    corr_matrix.loc[fi, fj], fi, fj, drop_col,
+                )
+
+    selected = [f for f in features if f not in to_drop]
+    log.info(
+        "Correlation filter removed %d features (threshold=%.2f)",
+        len(to_drop), threshold,
+    )
+    return selected
+
+
+def select_features(
+    X_binned: pd.DataFrame,
+    woe_tables: dict[str, pd.DataFrame],
+    iv_summary: pd.DataFrame,
+    keep_weak: bool = True,
+) -> tuple[list[str], list[str], pd.DataFrame]:
+    """
+    Full feature selection pipeline.
+
+    Parameters
+    ----------
+    keep_weak   : if True, include weak (0.02–0.1 IV) features after flagging
+
+    Returns
+    -------
+    selected_features : final list of feature names
+    flagged_features  : weak-IV features that were kept (flagged)
+    iv_summary        : updated with 'iv_band' column
+    """
+    strong, weak, dropped = _iv_selection(iv_summary)
+
+    log.info(
+        "IV bands — Strong (≥%.2f): %d | Weak (%.2f–%.2f): %d | Dropped (<%.2f): %d",
+        IV_STRONG_GTE, len(strong),
+        IV_DROP_BELOW, IV_STRONG_GTE, len(weak),
+        IV_DROP_BELOW, len(dropped),
+    )
+
+    if dropped:
+        log.info("Dropped (IV<%.2f): %s", IV_DROP_BELOW, dropped[:20])
+
+    candidate_features = strong + (weak if keep_weak else [])
+
+    # Build a temporary WoE dataset for the candidates only
+    X_woe_candidate = _apply_woe_transform(
+        X_binned[candidate_features], woe_tables
+    )
+
+    # Correlation filter
+    selected_features = _correlation_filter(X_woe_candidate, iv_summary)
+    flagged = [f for f in selected_features if f in weak]
+
+    # Annotate iv_summary
+    iv_band_map: dict[str, str] = {}
+    for f in strong:   iv_band_map[f] = "strong"
+    for f in weak:     iv_band_map[f] = "weak"
+    for f in dropped:  iv_band_map[f] = "dropped"
+    iv_summary = iv_summary.copy()
+    iv_summary["iv_band"] = iv_summary["feature"].map(iv_band_map)
+
+    log.info(
+        "Feature selection complete: %d features selected (%d flagged as weak)",
+        len(selected_features), len(flagged),
+    )
+    return selected_features, flagged, iv_summary
+
+
+# ============================================================================
+# SECTION 5 — WoE TRANSFORMATION
+# ============================================================================
+
+def _apply_woe_transform(
+    X_binned: pd.DataFrame,
+    woe_tables: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """
+    Replace each bin label with its WoE value.
+
+    Unknown bins (e.g. from unseen categories) receive WoE = 0.
+    """
+    X_woe = pd.DataFrame(index=X_binned.index)
+
+    for col in X_binned.columns:
+        if col not in woe_tables:
+            log.warning("No WoE table found for %s — skipping", col)
+            continue
+        woe_map = woe_tables[col].set_index("bin")["woe"].to_dict()
+        X_woe[col] = X_binned[col].map(woe_map).fillna(0.0)
+
+    return X_woe
+
+
+def transform_to_woe(
+    X_binned: pd.DataFrame,
+    woe_tables: dict[str, pd.DataFrame],
+    selected_features: list[str],
+) -> pd.DataFrame:
+    """
+    Apply WoE transformation to the selected features only.
+
+    Returns a DataFrame where every column is a WoE-encoded numeric feature,
+    with column names preserved (no renaming needed; values speak for themselves).
+    """
+    X_binned_selected = X_binned[selected_features]
+    X_woe = _apply_woe_transform(X_binned_selected, woe_tables)
+
+    # Guarantee numeric dtype and no NaNs
+    X_woe = X_woe.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    log.info("WoE transformation applied: shape %s", X_woe.shape)
+    return X_woe
+
+
+# ============================================================================
+# SECTION 6 — ARTIFACT PERSISTENCE
+# ============================================================================
+
+def save_artifacts(
+    X_woe: pd.DataFrame,
+    y: pd.Series,
+    woe_tables: dict[str, pd.DataFrame],
+    iv_summary: pd.DataFrame,
+    selected_features: list[str],
+    out_dir: Path = OUTPUT_DIR,
+) -> None:
+    """
+    Persist all pipeline artifacts to disk.
+
+    Files saved
+    -----------
+    X_woe.csv             — WoE-encoded feature matrix
+    y.csv                 — aligned binary target
+    woe_mappings.pkl      — {feature: woe_table DataFrame}
+    iv_summary.csv        — feature × IV × iv_band
+    selected_features.pkl — list of selected feature names
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. WoE dataset
+    xwoe_path = out_dir / "X_woe.csv"
+    X_woe.to_csv(xwoe_path, index=True)
+    log.info("Saved X_woe      → %s  (%d rows × %d cols)", xwoe_path, *X_woe.shape)
+
+    # 2. Target
+    y_path = out_dir / "y.csv"
+    y.to_frame(name=TARGET_COL).to_csv(y_path, index=True)
+    log.info("Saved y          → %s", y_path)
+
+    # 3. WoE mappings (full woe_tables dict)
+    woe_path = out_dir / "woe_mappings.pkl"
+    with open(woe_path, "wb") as fh:
+        pickle.dump(woe_tables, fh)
+    log.info("Saved woe_mappings → %s", woe_path)
+
+    # 4. IV summary
+    iv_path = out_dir / "iv_summary.csv"
+    iv_summary.to_csv(iv_path, index=False)
+    log.info("Saved iv_summary → %s", iv_path)
+
+    # 5. Selected features
+    sf_path = out_dir / "selected_features.pkl"
+    with open(sf_path, "wb") as fh:
+        pickle.dump(selected_features, fh)
+    log.info("Saved selected_features → %s  (%d features)", sf_path, len(selected_features))
+
+
+# ============================================================================
+# SECTION 7 — OUTPUT VALIDATION & REPORTING
+# ============================================================================
+
+def validate_and_report(
+    X_woe: pd.DataFrame,
+    y: pd.Series,
+    iv_summary: pd.DataFrame,
+    original_n_features: int,
+    flagged_features: list[str],
+) -> None:
+    """
+    Run post-pipeline checks and print a human-readable summary.
+    Raises AssertionError if critical checks fail.
+    """
+    print("\n" + "=" * 65)
+    print("  PIPELINE VALIDATION REPORT")
+    print("=" * 65)
+
+    # --- Dimensionality
+    print(f"\n  Features: {original_n_features} raw  →  {X_woe.shape[1]} selected")
+    print(f"  Observations : {X_woe.shape[0]:,}")
+
+    # --- NaN check
+    nan_counts = X_woe.isnull().sum()
+    assert nan_counts.sum() == 0, f"NaNs found in X_woe:\n{nan_counts[nan_counts > 0]}"
+    print("\n  ✓  No NaN values in X_woe")
+
+    # --- Numeric check
+    non_numeric = [c for c in X_woe.columns if not pd.api.types.is_numeric_dtype(X_woe[c])]
+    assert len(non_numeric) == 0, f"Non-numeric columns found: {non_numeric}"
+    print("  ✓  All features are numeric")
+
+    # --- Target alignment
+    assert len(X_woe) == len(y), "X_woe and y row counts do not match!"
+    assert set(y.unique()).issubset({0, 1}), "Target is not binary!"
+    print("  ✓  Target aligned and binary")
+
+    # --- Flagged features
+    if flagged_features:
+        print(f"\n  ⚠  Flagged (weak IV, kept): {flagged_features}")
+
+    # --- Top 10 by IV
+    top10 = iv_summary[iv_summary["feature"].isin(X_woe.columns)].head(10)
+    print("\n  Top 10 features by IV (selected only):")
+    print(
+        top10[["feature", "iv", "iv_band"]]
+        .to_string(index=False, float_format="%.4f")
+    )
+    print("\n" + "=" * 65 + "\n")
+
+    log.info("Validation passed ✓")
+
+
+# ============================================================================
+# INFERENCE HELPERS  (reuse mappings on new data)
+# ============================================================================
+
+def load_woe_artifacts(
+    out_dir: Path = OUTPUT_DIR,
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """
+    Load persisted WoE mappings and selected features for inference.
+
+    Returns
+    -------
+    woe_tables        : {feature: woe_table}
+    selected_features : list[str]
+    """
+    with open(out_dir / "woe_mappings.pkl", "rb") as fh:
+        woe_tables: dict[str, pd.DataFrame] = pickle.load(fh)
+    with open(out_dir / "selected_features.pkl", "rb") as fh:
+        selected_features: list[str] = pickle.load(fh)
+    log.info(
+        "Loaded %d WoE tables and %d selected features from %s",
+        len(woe_tables), len(selected_features), out_dir,
+    )
+    return woe_tables, selected_features
+
+
+def transform_inference(
+    X_new: pd.DataFrame,
+    woe_tables: dict[str, pd.DataFrame],
+    selected_features: list[str],
+    is_numeric: dict[str, bool] | None = None,
+    y_new: pd.Series | None = None,
+) -> pd.DataFrame:
+    """
+    Apply saved WoE mappings to a new dataset (inference / test set).
+
+    Parameters
+    ----------
+    X_new             : raw feature DataFrame (same schema as training data)
+    woe_tables        : loaded via load_woe_artifacts()
+    selected_features : loaded via load_woe_artifacts()
+    is_numeric        : optional dict from training-time bin_all_variables()
+                        (if None, dtype is inferred from X_new)
+    y_new             : optional target; only used for binning monotonicity if
+                        is_numeric is provided
+
+    Returns
+    -------
+    X_woe_new : WoE-transformed DataFrame aligned to selected_features
+    """
+    # Fill categoricals with "Missing"
+    X_new = X_new.copy()
+    cat_cols = X_new.select_dtypes(include=["object", "category"]).columns
+    X_new[cat_cols] = X_new[cat_cols].fillna("Missing")
+
+    # Bin each selected feature using the stored WoE table bin labels as a
+    # look-up (we don't re-fit bins; we map via the woe_table directly)
+    X_binned_new = pd.DataFrame(index=X_new.index)
+
+    for col in selected_features:
+        if col not in X_new.columns:
+            log.warning("Column %s not found in new data — filling WoE=0", col)
+            X_binned_new[col] = "Missing"
+            continue
+
+        tbl = woe_tables[col]
+        # Determine whether this column is numeric
+        if is_numeric is not None:
+            numeric = is_numeric.get(col, False)
+        else:
+            numeric = pd.api.types.is_numeric_dtype(X_new[col])
+
+        if numeric:
+            # Rebuild the bin cuts from the WoE table bin labels (IntervalIndex strings)
+            X_binned_new[col] = _bin_numeric_inference(
+                _coerce_numeric(X_new[col]), tbl
+            )
+        else:
+            X_binned_new[col] = _group_rare_categories(X_new[col].astype(str))
+
+    X_woe_new = _apply_woe_transform(X_binned_new, woe_tables)
+    X_woe_new = X_woe_new.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return X_woe_new
+
+
+def _bin_numeric_inference(
+    series: pd.Series,
+    woe_table: pd.DataFrame,
+) -> pd.Series:
+    """
+    Assign bins to new numeric data using the cuts stored in the WoE table.
+
+    Bin labels from training are Interval strings such as "(1.23, 4.56]".
+    We parse those back into cut-points and use pd.cut to assign bins.
+    Unknown or missing values fall into "Missing".
+    """
+    import re
+
+    missing_mask = series.isnull()
+    result = pd.Series("Missing", index=series.index, dtype=object)
+
+    # Extract bin boundaries from stored labels
+    known_bins = [b for b in woe_table["bin"].unique() if b != "Missing"]
+    # Try to parse "(lo, hi]" or "(-inf, hi]" or "(lo, inf]" style labels
+    cuts: list[float] = []
+    for label in known_bins:
+        m = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?|inf", label)
+        cuts.extend(float(v) for v in m)
+
+    if not cuts:
+        # fallback: no parseable cuts, assign first non-missing bin
+        if known_bins:
+            result[~missing_mask] = known_bins[0]
+        return result
+
+    unique_cuts = sorted(set(cuts))
+    unique_cuts = [-np.inf] + [c for c in unique_cuts if not np.isinf(c)] + [np.inf]
+
+    try:
+        binned = pd.cut(
+            series[~missing_mask],
+            bins=unique_cuts,
+            include_lowest=True,
+            right=True,
+        )
+        result[~missing_mask] = binned.astype(str)
+    except Exception:
+        result[~missing_mask] = known_bins[0] if known_bins else "bin_0"
+
+    return result
+
+
+# ============================================================================
+# MAIN PIPELINE
+# ============================================================================
+
+def run_pipeline(
+    raw_path: str,
+    out_dir: str | Path = OUTPUT_DIR,
+    keep_weak_iv: bool = True,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Execute the full ETL pipeline end-to-end.
+
+    Parameters
+    ----------
+    raw_path      : path to the raw CSV file
+    out_dir       : directory where all artifacts will be saved
+    keep_weak_iv  : whether to include 0.02–0.1 IV features (flagged)
+
+    Returns
+    -------
+    X_woe : WoE-encoded feature DataFrame
+    y     : aligned binary target Series
+    """
+    out_dir = Path(out_dir)
+
+    # -------------------------------------------------------------- 1. Load
+    df_raw = load_data(raw_path)
+
+    # -------------------------------------------------------------- 1. Target
+    df = create_target(df_raw)
+
+    # -------------------------------------------------------------- 1. Clean
+    X, y = clean_data(df)
+    original_n_features = X.shape[1]
+
+    # -------------------------------------------------------------- 2. Bin
+    log.info("Binning all variables ...")
+    X_binned, is_numeric = bin_all_variables(X, y)
+
+    # -------------------------------------------------------------- 3. WoE/IV
+    log.info("Computing WoE and IV ...")
+    woe_tables, iv_summary = compute_all_woe_iv(X_binned, y)
+
+    # -------------------------------------------------------------- 4. Select
+    log.info("Selecting features ...")
+    selected_features, flagged, iv_summary = select_features(
+        X_binned, woe_tables, iv_summary, keep_weak=keep_weak_iv
+    )
+
+    # -------------------------------------------------------------- 5. Transform
+    log.info("Transforming dataset to WoE space ...")
+    X_woe = transform_to_woe(X_binned, woe_tables, selected_features)
+
+    # -------------------------------------------------------------- 6. Save
+    log.info("Saving artifacts to %s ...", out_dir)
+    save_artifacts(X_woe, y, woe_tables, iv_summary, selected_features, out_dir)
+
+    # -------------------------------------------------------------- 7. Validate
+    validate_and_report(
+        X_woe, y, iv_summary, original_n_features, flagged
+    )
+
+    return X_woe, y
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    src = '/Users/lindokuhletami/Desktop/Space/data/loan_data_2007_2014(1).csv'
-    df = load_data(str(src))
+    import sys
 
-   
-    from sklearn.model_selection import train_test_split as _tts
-    ead_full = compute_ead(df)
+    DATA_PATH = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "/Users/lindokuhletami/Desktop/Space/data/loan_data_2007_2014(1).csv"
+    )
 
-    X_train, y_train, X_test, y_test = split_and_prepare(df)
-
-    # Re-split EAD using the same indices produced by split_and_prepare
-    ead_train = ead_full.loc[X_train.index].reset_index(drop=True)
-    ead_test  = ead_full.loc[X_test.index].reset_index(drop=True)
-
-    out = str(Path(__file__).parents[1] / "data")
-    save_outputs(X_train, y_train, X_test, y_test, out,
-                 ead_train=ead_train, ead_test=ead_test)
-
-    print(f"\nEAD stats (train):")
-    print(ead_train.describe())
+    X_woe, y = run_pipeline(
+        raw_path=DATA_PATH,
+        out_dir=OUTPUT_DIR,
+        keep_weak_iv=True,
+    )

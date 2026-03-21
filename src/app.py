@@ -11,8 +11,8 @@ from scipy.stats import norm as _norm
 
 sys.path.append(os.path.dirname(__file__))
 
-from ETL import prepare_inputs
-from Scorecard import build_scorecard, calculate_credit_score, get_risk_tier, get_approval_decision
+from ETL import transform_inference, load_woe_artifacts
+from Scorecard import build_scorecard, calculate_credit_score, get_risk_band, get_approval_decision
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -40,7 +40,6 @@ h1, h2, h3 {
     letter-spacing: -0.02em;
 }
 
-/* Sidebar */
 section[data-testid="stSidebar"] {
     background: #0f1923;
     border-right: 1px solid #1e2d3d;
@@ -53,7 +52,6 @@ section[data-testid="stSidebar"] .stRadio label {
     padding: 6px 0;
 }
 
-/* Metric cards */
 div[data-testid="metric-container"] {
     background: #0f1923;
     border: 1px solid #1e2d3d;
@@ -72,7 +70,6 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
     font-weight: 500;
 }
 
-/* Section headers */
 .section-label {
     font-size: 0.72rem;
     text-transform: uppercase;
@@ -82,13 +79,8 @@ div[data-testid="metric-container"] div[data-testid="stMetricValue"] {
     margin-top: 20px;
 }
 
-/* Dividers */
 hr { border-color: #1e2d3d; }
 
-/* Tables */
-.dataframe { font-size: 0.85rem; }
-
-/* Buttons */
 div[data-testid="stFormSubmitButton"] button {
     background: #1a6baa !important;
     color: white !important;
@@ -109,7 +101,8 @@ div[data-testid="stFormSubmitButton"] button:hover {
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def load_pd_model():
-    path = os.path.join(os.path.dirname(__file__), "pd_model.sav")
+    # New pipeline: scorecard_outputs/model.pkl  (trained by train.py on WoE features)
+    path = os.path.join(os.path.dirname(__file__), "..", "scorecard_outputs", "model.pkl")
     if not os.path.exists(path):
         return None
     with open(path, "rb") as f:
@@ -118,7 +111,8 @@ def load_pd_model():
 
 @st.cache_resource
 def load_features():
-    path = os.path.join(os.path.dirname(__file__), "pd_model_features.pkl")
+    # New pipeline: scorecard_outputs/feature_names.pkl  (saved by train.py)
+    path = os.path.join(os.path.dirname(__file__), "..", "scorecard_outputs", "feature_names.pkl")
     if not os.path.exists(path):
         return None
     with open(path, "rb") as f:
@@ -145,18 +139,57 @@ def load_lgd_model():
 
 @st.cache_resource
 def load_threshold():
+    # Try to read best_threshold from model_metrics.pkl (set by evaluate.py)
+    for base in [
+        os.path.join(os.path.dirname(__file__), "..", "scorecard_outputs"),
+        os.path.dirname(__file__),
+    ]:
+        path = os.path.join(base, "model_metrics.pkl")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                m = pickle.load(f)
+            return m.get("best_threshold", 0.5)
+    # Legacy fallback
     path = os.path.join(os.path.dirname(__file__), "pd_model_threshold.pkl")
-    if not os.path.exists(path):
-        return 0.5   # fall back to sklearn default if not found
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return 0.5
+
+
+@st.cache_resource
+def load_model_metrics():
+    # Try new pipeline location first, fall back to src/
+    for base in [
+        os.path.join(os.path.dirname(__file__), "..", "scorecard_outputs"),
+        os.path.dirname(__file__),
+    ]:
+        path = os.path.join(base, "model_metrics.pkl")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    return None
+
+
+@st.cache_resource
+def load_woe_mappings():
+    # Loads woe_mappings.pkl and selected_features.pkl saved by woe_etl.py
+    root = os.path.join(os.path.dirname(__file__), "..", "scorecard_outputs")
+    woe_path  = os.path.join(root, "woe_mappings.pkl")
+    feat_path = os.path.join(root, "selected_features.pkl")
+    if not os.path.exists(woe_path) or not os.path.exists(feat_path):
+        return None, None
+    with open(woe_path, "rb") as f:
+        woe_tables = pickle.load(f)
+    with open(feat_path, "rb") as f:
+        selected_features = pickle.load(f)
+    return woe_tables, selected_features
 
 
 # ---------------------------------------------------------------------------
 # Capital requirement helpers (Basel II IRB retail — §328)
 # ---------------------------------------------------------------------------
 def _basel_correlation(pd_arr):
-    """Asset correlation R for retail exposures (Basel II §328)."""
     e50 = np.exp(-50)
     return (
         0.12 * (1 - np.exp(-50 * pd_arr)) / (1 - e50)
@@ -165,12 +198,6 @@ def _basel_correlation(pd_arr):
 
 
 def _capital_requirement(pd_arr, lgd_arr, ead_arr, maturity_adj=1.06):
-    """
-    Basel II IRB Retail capital requirement (§328).
-
-    K   = LGD × [N(G(PD)/√(1−R) + √(R/(1−R)) × G(0.999)) − PD] × 1.06
-    RWA = K × EAD × 12.5
-    """
     pd_arr  = np.clip(pd_arr,  1e-6, 1 - 1e-6)
     lgd_arr = np.clip(lgd_arr, 0, 1)
     R       = _basel_correlation(pd_arr)
@@ -190,7 +217,7 @@ with st.sidebar:
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     page = st.radio(
         "Navigate",
-        ["🔍 Applicant Assessment", "📊 Portfolio Dashboard"],
+        ["🔍 Applicant Assessment", "📊 Portfolio Dashboard", "🧪 Model Performance"],
         label_visibility="collapsed",
     )
     st.markdown("---")
@@ -200,7 +227,7 @@ with st.sidebar:
         "EL = PD × LGD × EAD<br><br>"
         "LGD: 45% regulatory constant<br>"
         "EAD: funded_amnt − total_pymnt<br>"
-        "Score scale: 300–850 (ZA)<br>"
+        "Score scale: 300–850 (ZA / TransUnion)<br>"
         f"PD threshold: {load_threshold():.2f}"
         "</div>",
         unsafe_allow_html=True,
@@ -221,26 +248,31 @@ if page == "🔍 Applicant Assessment":
         unsafe_allow_html=True,
     )
 
-    # Load model artefacts
-    model                = load_pd_model()
-    significant_features = load_features()
-    lgd_model            = load_lgd_model()
-    threshold            = load_threshold()
+    model                    = load_pd_model()
+    feature_names            = load_features()
+    lgd_model                = load_lgd_model()
+    threshold                = load_threshold()
+    woe_tables, woe_features = load_woe_mappings()
 
     if model is None:
-        st.error("pd_model.sav not found. Run fit_model.py first.")
+        st.error("model.pkl not found in scorecard_outputs/. Run train.py first.")
         st.stop()
-    if significant_features is None:
-        st.error("pd_model_features.pkl not found. Run fit_model.py first.")
+    if feature_names is None:
+        st.error("feature_names.pkl not found in scorecard_outputs/. Run train.py first.")
+        st.stop()
+    if woe_tables is None:
+        st.error("woe_mappings.pkl not found in scorecard_outputs/. Run woe_etl.py first.")
         st.stop()
 
-    # Build scorecard — uses absolute PDO formula, no min-max scaling
+    # active_features: WoE feature list from ETL (must match model.pkl exactly)
+    active_features = woe_features if woe_features is not None else feature_names
+
     scorecard, base_points = build_scorecard(
         model,
-        feature_names=significant_features,
-        pdo=50,
-        base_score=600,
-        base_odds=50,
+        feature_names=active_features,
+        pdo=20,           # SA market: tighter PDO for high-default environment
+        base_score=620,   # anchors 8:1 odds borrower at mid-Favourable tier
+        base_odds=8,      # ~11% default rate (NCR SA unsecured benchmark)
     )
 
     with st.form("prediction_form"):
@@ -327,71 +359,63 @@ if page == "🔍 Applicant Assessment":
                     "total_rev_hi_lim": revol_bal / (revol_util / 100) if revol_util > 0 else revol_bal,
                 }])
 
-                X_prepared, _, _, _ = prepare_inputs(
-                    input_df, reference_date="2017-12-01",
-                    target_col=None, fit_ohe=False, fit_train_params=False,
-                    train_params={"annual_inc_mean": annual_inc,
-                                  "max_mths_issue_d": 84,
-                                  "max_mths_earliest_cr_line": 400},
+                # transform_inference applies the saved WoE bin mappings
+                # to the raw input — no manual feature engineering needed
+                X_final = transform_inference(
+                    input_df,
+                    woe_tables=woe_tables,
+                    selected_features=active_features,
                 )
 
-                # Align to saved significant features
-                X_final = pd.DataFrame(0, index=[0], columns=significant_features)
-                for col in significant_features:
-                    if col in X_prepared.columns:
-                        X_final[col] = X_prepared[col].values[0]
+                # Ensure all active features are present (fill 0 = neutral WoE)
+                for col in active_features:
+                    if col not in X_final.columns:
+                        X_final[col] = 0.0
+                X_final = X_final[active_features]
 
                 X_arr      = X_final.values.astype(np.float64)
                 proba_arr  = model.predict_proba(X_arr)[0]
                 p_good     = proba_arr[1]
-                pd_val     = 1 - p_good    # PD = P(default)
+                pd_val     = 1 - p_good
                 el         = pd_val * lgd * ead
-
-                # Apply the saved optimal threshold (not sklearn default 0.5)
-                # 1 = good loan, 0 = default
-                model_decision = int(p_good >= threshold)
-
-                # Absolute PDO credit score — approval decision driven by score
+                # Score-based decision (TransUnion SA bands — threshold=614 Favourable)
                 credit_score = calculate_credit_score(
                     X_final, scorecard, base_points, min_score=300, max_score=850
                 )[0]
-                risk_tier = get_risk_tier(credit_score)
+                risk_band = get_risk_band(credit_score)
                 decision  = get_approval_decision(credit_score)
 
-                # Capital requirement for this single loan
                 K_loan, rwa_loan = _capital_requirement(
                     np.array([pd_val]), np.array([lgd]), np.array([ead])
                 )
                 cap_req_loan = float(K_loan[0] * ead)
 
-                # ----------------------------------------------------------
-                # Results
-                # ----------------------------------------------------------
                 st.markdown("---")
                 st.markdown("### Assessment Results")
 
                 m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-                m1.metric("Credit Score",        f"{credit_score}")
-                m2.metric("Risk Tier",           risk_tier.split(" - ")[0])
-                m3.metric("PD",                  f"{pd_val:.2%}")
-                m4.metric("P(Good)",             f"{p_good:.2%}")
-                m5.metric("Expected Loss",       f"${el:,.0f}")
-                m6.metric("Model Threshold",     f"{threshold:.2f}")
+                m1.metric("Credit Score",    f"{credit_score}")
+                m2.metric("Risk Band",       risk_band.split(" ")[0])
+                m3.metric("PD",              f"{pd_val:.2%}")
+                m4.metric("P(Good)",         f"{p_good:.2%}")
+                m5.metric("Expected Loss",   f"${el:,.0f}")
+                m6.metric("Score Cut-off",   "614 (Favourable)")
                 m7.metric("Decision",
-                          "✅ Approve" if decision == "Approve" else "❌ Decline")
+                          "✅ Approve" if decision == "Approve"
+                          else "🔄 Refer" if decision == "Refer"
+                          else "❌ Decline")
 
-                # Gauge
                 score_color = (
-                    "#22c55e" if credit_score >= 670 else
-                    "#84cc16" if credit_score >= 592 else
-                    "#eab308" if credit_score >= 560 else
-                    "#f97316" if credit_score >= 505 else "#ef4444"
+                    "#22c55e" if credit_score >= 681 else
+                    "#84cc16" if credit_score >= 614 else
+                    "#eab308" if credit_score >= 583 else
+                    "#f97316" if credit_score >= 487 else "#ef4444"
                 )
                 fig_gauge = go.Figure(go.Indicator(
                     mode="gauge+number",
                     value=credit_score,
                     domain={"x": [0, 1], "y": [0, 1]},
-                    title={"text": "Credit Score", "font": {"size": 18}},
+                    title={"text": "Credit Score (TransUnion SA)", "font": {"size": 16}},
                     number={"font": {"color": score_color, "size": 48}},
                     gauge={
                         "axis": {"range": [300, 850], "tickcolor": "#4a7fa5"},
@@ -399,17 +423,18 @@ if page == "🔍 Applicant Assessment":
                         "bgcolor": "#0f1923",
                         "bordercolor": "#1e2d3d",
                         "steps": [
-                            {"range": [300, 505], "color": "#2d1515"},
-                            {"range": [505, 560], "color": "#2d1e0f"},
-                            {"range": [560, 592], "color": "#2d2a0f"},
-                            {"range": [592, 670], "color": "#152d15"},
-                            {"range": [670, 850], "color": "#0f2d0f"},
+                            {"range": [300, 487], "color": "#2d1515"},   # Poor
+                            {"range": [487, 527], "color": "#2d1e0f"},   # Unfavourable
+                            {"range": [527, 583], "color": "#2d2a0f"},   # Below Average
+                            {"range": [583, 614], "color": "#1e2d1e"},   # Average
+                            {"range": [614, 681], "color": "#152d15"},   # Favourable
+                            {"range": [681, 767], "color": "#0f2a0f"},   # Good
+                            {"range": [767, 850], "color": "#0a1f0a"},   # Excellent
                         ],
                     },
                 ))
                 fig_gauge.update_layout(
-                    height=280,
-                    paper_bgcolor="#080e14",
+                    height=280, paper_bgcolor="#080e14",
                     font_color="#c9d6e3",
                     margin=dict(t=40, b=10, l=20, r=20),
                 )
@@ -429,18 +454,22 @@ if page == "🔍 Applicant Assessment":
 | Capital Requirement (K × EAD) | ${cap_req_loan:,.2f} |
 | RWA | ${float(rwa_loan[0]):,.2f} |
 """)
-                    if credit_score >= 670:
-                        st.success("**Excellent Credit** — Low risk, favourable terms available.")
-                    elif credit_score >= 592:
-                        st.success("**Good Credit** — Moderate risk, standard terms.")
-                    elif credit_score >= 560:
-                        st.warning("**Average Credit** — Medium risk, higher rates may apply.")
-                    elif credit_score >= 505:
-                        st.error("**Below Average** — High risk, limited options.")
+                    # SA TransUnion band messaging
+                    if credit_score >= 767:
+                        st.success(f"**Excellent** (767–850) — Very low risk. Best available rates.")
+                    elif credit_score >= 681:
+                        st.success(f"**Good** (681–766) — Low risk. Standard prime rates.")
+                    elif credit_score >= 614:
+                        st.info(f"**Favourable** (614–680) — Moderate risk. NCA affordability check required.")
+                    elif credit_score >= 583:
+                        st.warning(f"**Average** (583–613) — Elevated risk. Higher rates may apply.")
+                    elif credit_score >= 527:
+                        st.warning(f"**Below Average** (527–582) — High risk. Secured options recommended.")
+                    elif credit_score >= 487:
+                        st.error(f"**Unfavourable** (487–526) — Very high risk.")
                     else:
-                        st.error("**High Risk** — Very high risk, consider secured options.")
+                        st.error(f"**Poor** (300–486) — Decline recommended.")
 
-                # Score factors
                 with st.expander("View Score Factors"):
                     contribs = [
                         {"Feature": f, "Points Contribution": round(X_final[f].values[0] * r, 2)}
@@ -471,7 +500,8 @@ if page == "🔍 Applicant Assessment":
 # ===========================================================================
 # PAGE 2 — PORTFOLIO DASHBOARD
 # ===========================================================================
-else:
+elif page == "📊 Portfolio Dashboard":
+
     st.title("Portfolio Risk Dashboard")
     st.markdown(
         "<div style='color:#7a9bb5; margin-bottom:24px'>"
@@ -484,78 +514,55 @@ else:
     el = load_el_results()
 
     if el is None:
-        st.warning(
-            "el_results.pkl not found. Run `expected_loss.py` to generate portfolio metrics.",
-            icon="⚠️",
-        )
+        st.warning("el_results.pkl not found. Run expected_loss.py to generate portfolio metrics.", icon="⚠️")
         st.stop()
 
     portfolio  = el["portfolio"]
     loan_level = el["loan_level"]
     summary    = el["summary"]
 
-    # ------------------------------------------------------------------
-    # KPI row
-    # ------------------------------------------------------------------
     st.markdown("### Portfolio Overview")
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Loans",         f"{portfolio['n_loans']:,}")
-    k2.metric("Total EAD",           f"${portfolio['total_ead']:,.0f}")
-    k3.metric("Total Expected Loss",  f"${portfolio['total_el']:,.0f}")
-    k4.metric("EL Rate",              f"{portfolio['el_rate']:.3%}")
-    k5.metric("Mean PD",              f"{portfolio['mean_pd']:.3%}")
+    k1.metric("Total Loans",            f"{portfolio['n_loans']:,}")
+    k2.metric("Total EAD",              f"${portfolio['total_ead']:,.0f}")
+    k3.metric("Total Expected Loss",     f"${portfolio['total_el']:,.0f}")
+    k4.metric("EL Rate",                 f"{portfolio['el_rate']:.3%}")
+    k5.metric("Mean PD",                 f"{portfolio['mean_pd']:.3%}")
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     k6, k7, k8 = st.columns(3)
-    k6.metric("Mean LGD",              f"{portfolio['mean_lgd']:.1%}")
-    k7.metric("Mean EAD per Loan",     f"${portfolio['mean_ead']:,.0f}")
+    k6.metric("Mean LGD",               f"{portfolio['mean_lgd']:.1%}")
+    k7.metric("Mean EAD per Loan",      f"${portfolio['mean_ead']:,.0f}")
     k8.metric("High-Risk Loans (PD≥50%)",
               f"{portfolio['n_high_risk']:,} ({portfolio['n_high_risk']/portfolio['n_loans']:.1%})")
 
     st.markdown("---")
-
-    # ------------------------------------------------------------------
-    # Row 1: EL by grade bar + EL rate by grade line
-    # ------------------------------------------------------------------
     st.markdown("### Expected Loss by Grade")
     r1c1, r1c2 = st.columns(2)
 
     with r1c1:
         fig_el = px.bar(
-            summary.reset_index(),
-            x="grade", y="total_el",
+            summary.reset_index(), x="grade", y="total_el",
             color="total_el",
             color_continuous_scale=["#22c55e", "#eab308", "#ef4444"],
             labels={"total_el": "Total EL ($)", "grade": "Grade"},
-            template="plotly_dark",
-            title="Total Expected Loss by Grade",
+            template="plotly_dark", title="Total Expected Loss by Grade",
         )
-        fig_el.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            coloraxis_showscale=False,
-            margin=dict(t=40, b=20, l=0, r=0),
-        )
+        fig_el.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                             coloraxis_showscale=False, margin=dict(t=40,b=20,l=0,r=0))
         st.plotly_chart(fig_el, use_container_width=True)
 
     with r1c2:
         fig_rate = px.line(
-            summary.reset_index(),
-            x="grade", y="el_rate", markers=True,
+            summary.reset_index(), x="grade", y="el_rate", markers=True,
             labels={"el_rate": "EL Rate (EL/EAD)", "grade": "Grade"},
-            template="plotly_dark",
-            title="EL Rate by Grade",
+            template="plotly_dark", title="EL Rate by Grade",
         )
         fig_rate.update_traces(line_color="#f97316", marker_color="#f97316", line_width=2.5)
-        fig_rate.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            margin=dict(t=40, b=20, l=0, r=0),
-            yaxis_tickformat=".2%",
-        )
+        fig_rate.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                               margin=dict(t=40,b=20,l=0,r=0), yaxis_tickformat=".2%")
         st.plotly_chart(fig_rate, use_container_width=True)
 
-    # ------------------------------------------------------------------
-    # Row 2: PD distribution + EAD vs EL scatter
-    # ------------------------------------------------------------------
     st.markdown("### Risk Distribution")
     r2c1, r2c2 = st.columns(2)
 
@@ -564,14 +571,10 @@ else:
             loan_level, x="pd", nbins=50,
             color_discrete_sequence=["#1a6baa"],
             labels={"pd": "Predicted PD"},
-            template="plotly_dark",
-            title="Distribution of Predicted PD",
+            template="plotly_dark", title="Distribution of Predicted PD",
         )
-        fig_pd.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            margin=dict(t=40, b=20, l=0, r=0),
-            bargap=0.05,
-        )
+        fig_pd.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                             margin=dict(t=40,b=20,l=0,r=0), bargap=0.05)
         st.plotly_chart(fig_pd, use_container_width=True)
 
     with r2c2:
@@ -581,18 +584,12 @@ else:
             color_continuous_scale=["#22c55e", "#eab308", "#ef4444"],
             opacity=0.5,
             labels={"ead": "EAD ($)", "el": "EL ($)", "pd": "PD"},
-            template="plotly_dark",
-            title="EAD vs EL (coloured by PD)",
+            template="plotly_dark", title="EAD vs EL (coloured by PD)",
         )
-        fig_scatter.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            margin=dict(t=40, b=20, l=0, r=0),
-        )
+        fig_scatter.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                                  margin=dict(t=40,b=20,l=0,r=0))
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-    # ------------------------------------------------------------------
-    # Row 3: Grade composition + EL concentration curve
-    # ------------------------------------------------------------------
     st.markdown("### Portfolio Composition")
     r3c1, r3c2 = st.columns(2)
 
@@ -602,47 +599,30 @@ else:
         fig_pie = px.pie(
             grade_counts, values="count", names="grade",
             color_discrete_sequence=px.colors.sequential.Blues_r,
-            template="plotly_dark",
-            title="Loan Count by Grade",
-            hole=0.45,
+            template="plotly_dark", title="Loan Count by Grade", hole=0.45,
         )
-        fig_pie.update_layout(
-            paper_bgcolor="#080e14",
-            margin=dict(t=40, b=20, l=0, r=0),
-        )
+        fig_pie.update_layout(paper_bgcolor="#080e14", margin=dict(t=40,b=20,l=0,r=0))
         st.plotly_chart(fig_pie, use_container_width=True)
 
     with r3c2:
-        loan_level_sorted = loan_level.sort_values("el", ascending=False).reset_index(drop=True)
-        loan_level_sorted["cumulative_el_share"] = loan_level_sorted["el"].cumsum() / loan_level_sorted["el"].sum()
-        loan_level_sorted["pct_of_portfolio"] = (loan_level_sorted.index + 1) / len(loan_level_sorted)
-
+        ll_sorted = loan_level.sort_values("el", ascending=False).reset_index(drop=True)
+        ll_sorted["cumulative_el_share"] = ll_sorted["el"].cumsum() / ll_sorted["el"].sum()
+        ll_sorted["pct_of_portfolio"]    = (ll_sorted.index + 1) / len(ll_sorted)
         fig_conc = px.area(
-            loan_level_sorted,
-            x="pct_of_portfolio", y="cumulative_el_share",
+            ll_sorted, x="pct_of_portfolio", y="cumulative_el_share",
             labels={"pct_of_portfolio": "% of Loans (ranked by EL)",
                     "cumulative_el_share": "Cumulative EL Share"},
-            template="plotly_dark",
-            title="EL Concentration Curve",
+            template="plotly_dark", title="EL Concentration Curve",
             color_discrete_sequence=["#f97316"],
         )
-        fig_conc.add_scatter(
-            x=[0, 1], y=[0, 1],
-            mode="lines",
-            line=dict(color="#4a7fa5", dash="dash", width=1.5),
-            name="Equal distribution",
-            showlegend=True,
-        )
-        fig_conc.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            margin=dict(t=40, b=20, l=0, r=0),
-            yaxis_tickformat=".0%", xaxis_tickformat=".0%",
-        )
+        fig_conc.add_scatter(x=[0,1], y=[0,1], mode="lines",
+                             line=dict(color="#4a7fa5", dash="dash", width=1.5),
+                             name="Equal distribution", showlegend=True)
+        fig_conc.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                               margin=dict(t=40,b=20,l=0,r=0),
+                               yaxis_tickformat=".0%", xaxis_tickformat=".0%")
         st.plotly_chart(fig_conc, use_container_width=True)
 
-    # ------------------------------------------------------------------
-    # Grade summary table
-    # ------------------------------------------------------------------
     st.markdown("### Grade-Level Summary Table")
     display_summary = summary.copy()
     display_summary["mean_pd"]   = display_summary["mean_pd"].map("{:.3%}".format)
@@ -652,28 +632,18 @@ else:
     display_summary["total_el"]  = display_summary["total_el"].map("${:,.0f}".format)
     display_summary["mean_el"]   = display_summary["mean_el"].map("${:,.2f}".format)
     display_summary = display_summary.rename(columns={
-        "n_loans":  "Loans",
-        "mean_pd":  "Mean PD",
-        "mean_lgd": "Mean LGD",
-        "total_ead":"Total EAD",
-        "total_el": "Total EL",
-        "mean_el":  "Mean EL",
-        "el_rate":  "EL Rate",
+        "n_loans": "Loans", "mean_pd": "Mean PD", "mean_lgd": "Mean LGD",
+        "total_ead": "Total EAD", "total_el": "Total EL",
+        "mean_el": "Mean EL", "el_rate": "EL Rate",
     })
     st.dataframe(display_summary, use_container_width=True)
 
     st.markdown("---")
-
-    # ------------------------------------------------------------------
-    # Capital Requirements (Basel II IRB retail — §328)
-    # ------------------------------------------------------------------
-    st.markdown("### Capital Requirements")
+    st.markdown("### Capital Requirements (Basel II IRB §328)")
     st.markdown(
         "<div style='color:#7a9bb5; margin-bottom:16px; font-size:0.88rem'>"
-        "Basel II IRB retail formula (§328): "
         "K = LGD × [N(G(PD)/√(1−R) + √(R/(1−R)) × G(0.999)) − PD] × 1.06 &nbsp;·&nbsp; "
-        "RWA = K × EAD × 12.5 &nbsp;·&nbsp; "
-        "Min Tier 1 = 6% of RWA &nbsp;·&nbsp; Min Total = 8% of RWA"
+        "RWA = K × EAD × 12.5"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -681,100 +651,270 @@ else:
     pd_arr  = loan_level["pd"].values
     lgd_arr = loan_level["lgd"].values
     ead_arr = loan_level["ead"].values
-
     K_arr, rwa_arr = _capital_requirement(pd_arr, lgd_arr, ead_arr)
-
     total_rwa     = rwa_arr.sum()
     total_cap_req = (K_arr * ead_arr).sum()
-    min_cap_t1    = total_rwa * 0.06
-    min_cap_total = total_rwa * 0.08
 
     cr1, cr2, cr3, cr4 = st.columns(4)
     cr1.metric("Total RWA",                f"${total_rwa:,.0f}")
     cr2.metric("Total Capital Required",   f"${total_cap_req:,.0f}")
-    cr3.metric("Min Capital (Tier 1, 6%)", f"${min_cap_t1:,.0f}")
-    cr4.metric("Min Capital (Total, 8%)",  f"${min_cap_total:,.0f}")
+    cr3.metric("Min Capital (Tier 1, 6%)", f"${total_rwa * 0.06:,.0f}")
+    cr4.metric("Min Capital (Total, 8%)",  f"${total_rwa * 0.08:,.0f}")
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-
-    # Capital by grade
-    loan_level_cap               = loan_level.copy()
-    loan_level_cap["K"]          = K_arr
-    loan_level_cap["rwa"]        = rwa_arr
+    loan_level_cap = loan_level.copy()
+    loan_level_cap["K"]   = K_arr
+    loan_level_cap["rwa"] = rwa_arr
     loan_level_cap["capital_required"] = K_arr * ead_arr
 
     cap_by_grade = (
         loan_level_cap.groupby("grade")
-        .agg(
-            total_rwa         = ("rwa",              "sum"),
-            total_capital_req = ("capital_required", "sum"),
-            mean_K            = ("K",                "mean"),
-        )
-        .assign(rwa_density=lambda d: d["total_rwa"] /
-                loan_level_cap.groupby("grade")["ead"].sum())
+        .agg(total_rwa=("rwa","sum"), total_capital_req=("capital_required","sum"), mean_K=("K","mean"))
+        .assign(rwa_density=lambda d: d["total_rwa"] / loan_level_cap.groupby("grade")["ead"].sum())
         .sort_index()
     )
 
     cr_l, cr_r = st.columns(2)
-
     with cr_l:
-        fig_rwa = px.bar(
-            cap_by_grade.reset_index(),
-            x="grade", y="total_rwa",
-            color="total_rwa",
-            color_continuous_scale=["#1a6baa", "#f97316", "#ef4444"],
-            labels={"total_rwa": "Total RWA ($)", "grade": "Grade"},
-            template="plotly_dark",
-            title="Risk-Weighted Assets (RWA) by Grade",
-        )
-        fig_rwa.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            coloraxis_showscale=False,
-            margin=dict(t=40, b=20, l=0, r=0),
-        )
+        fig_rwa = px.bar(cap_by_grade.reset_index(), x="grade", y="total_rwa",
+                         color="total_rwa",
+                         color_continuous_scale=["#1a6baa","#f97316","#ef4444"],
+                         labels={"total_rwa":"Total RWA ($)","grade":"Grade"},
+                         template="plotly_dark", title="RWA by Grade")
+        fig_rwa.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                              coloraxis_showscale=False, margin=dict(t=40,b=20,l=0,r=0))
         st.plotly_chart(fig_rwa, use_container_width=True)
 
     with cr_r:
-        fig_k = px.bar(
-            cap_by_grade.reset_index(),
-            x="grade", y="mean_K",
-            color="mean_K",
-            color_continuous_scale=["#1a6baa", "#f97316", "#ef4444"],
-            labels={"mean_K": "Mean Capital Requirement (K)", "grade": "Grade"},
-            template="plotly_dark",
-            title="Mean Capital Requirement (K) by Grade",
-        )
-        fig_k.update_layout(
-            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-            coloraxis_showscale=False,
-            yaxis_tickformat=".2%",
-            margin=dict(t=40, b=20, l=0, r=0),
-        )
+        fig_k = px.bar(cap_by_grade.reset_index(), x="grade", y="mean_K",
+                       color="mean_K",
+                       color_continuous_scale=["#1a6baa","#f97316","#ef4444"],
+                       labels={"mean_K":"Mean K","grade":"Grade"},
+                       template="plotly_dark", title="Mean Capital Requirement (K) by Grade")
+        fig_k.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+                            coloraxis_showscale=False, yaxis_tickformat=".2%",
+                            margin=dict(t=40,b=20,l=0,r=0))
         st.plotly_chart(fig_k, use_container_width=True)
 
-    # Capital requirements table
-    st.markdown("### Capital Requirements by Grade")
     cap_display = cap_by_grade.copy()
     cap_display["total_rwa"]         = cap_display["total_rwa"].map("${:,.0f}".format)
     cap_display["total_capital_req"] = cap_display["total_capital_req"].map("${:,.0f}".format)
     cap_display["mean_K"]            = cap_display["mean_K"].map("{:.3%}".format)
     cap_display["rwa_density"]       = cap_display["rwa_density"].map("{:.2f}x".format)
     cap_display = cap_display.rename(columns={
-        "total_rwa":         "Total RWA",
-        "total_capital_req": "Capital Required",
-        "mean_K":            "Mean K",
-        "rwa_density":       "RWA Density (RWA/EAD)",
+        "total_rwa":"Total RWA","total_capital_req":"Capital Required",
+        "mean_K":"Mean K","rwa_density":"RWA Density (RWA/EAD)",
     })
     st.dataframe(cap_display, use_container_width=True)
 
     st.markdown("---")
     st.markdown(
-        "<div style='font-size:0.75rem; color:#4a7fa5'>"
+        f"<div style='font-size:0.75rem; color:#4a7fa5'>"
         f"Data: test split ({portfolio['n_loans']:,} loans) · "
-        f"LGD: Basel II 45% constant · "
-        f"EAD: funded_amnt − total_pymnt · "
-        f"Capital: Basel II IRB retail §328 · "
-        f"Generated: {datetime.now().strftime('%Y-%m-%d')}"
+        f"LGD: Basel II 45% constant · EAD: funded_amnt − total_pymnt · "
+        f"Generated: {datetime.now().strftime('%Y-%m-%d')}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ===========================================================================
+# PAGE 3 — MODEL PERFORMANCE
+# ===========================================================================
+else:
+    st.title("Model Performance")
+    st.markdown(
+        "<div style='color:#7a9bb5; margin-bottom:24px'>"
+        "WoE logistic regression scorecard — discrimination, bad loan detection, "
+        "and threshold analysis. Run evaluate.py to refresh these metrics."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    metrics = load_model_metrics()
+
+    if metrics is None:
+        st.warning(
+            "model_metrics.pkl not found. Run `evaluate.py` first to generate metrics.",
+            icon="⚠️",
+        )
+        st.stop()
+
+    # ── Section 1: Discrimination (threshold-independent) ────────────────────
+    st.markdown("### Discrimination Metrics")
+    st.markdown(
+        "<div style='color:#7a9bb5; font-size:0.85rem; margin-bottom:16px'>"
+        "These metrics do not depend on the classification threshold — "
+        "they measure the model's ability to rank borrowers by risk."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric(
+        "ROC-AUC",
+        f"{metrics['auc']:.4f}",
+        help="Area under the ROC curve. 0.5 = random, 1.0 = perfect.",
+    )
+    d2.metric(
+        "Gini Coefficient",
+        f"{metrics['gini']:.4f}",
+        delta="Good" if metrics["gini"] >= 0.3 else "Below 0.30 threshold",
+        delta_color="normal" if metrics["gini"] >= 0.3 else "inverse",
+        help="Gini = 2×AUC − 1. Industry minimum: 0.30 (30%).",
+    )
+    d3.metric(
+        "KS Statistic",
+        f"{metrics['ks']:.4f}",
+        delta="Good" if metrics["ks"] >= 0.2 else "Below 0.20 threshold",
+        delta_color="normal" if metrics["ks"] >= 0.2 else "inverse",
+        help="Max separation between cumulative good/bad distributions. Minimum: 0.20.",
+    )
+    d4.metric(
+        "PSI",
+        f"{metrics['psi']:.4f}",
+        delta=metrics["psi_status"],
+        delta_color="normal" if metrics["psi"] < 0.10 else ("off" if metrics["psi"] < 0.25 else "inverse"),
+        help="Population Stability Index. <0.10 stable, 0.10–0.25 monitor, >0.25 retrain.",
+    )
+
+    st.markdown("---")
+
+    # ── Section 2: Bad Loan Detection ────────────────────────────────────────
+    st.markdown("### Bad Loan Detection")
+    st.markdown(
+        f"<div style='color:#7a9bb5; font-size:0.85rem; margin-bottom:16px'>"
+        f"Metrics at the best recall threshold "
+        f"(<b style='color:#e8f0f7'>t = {metrics['best_threshold']}</b>). "
+        f"Bad = Default (class 0). Recall is the primary metric — a missed "
+        f"default is an unexpected loss."
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    b1, b2, b3 = st.columns(3)
+    b1.metric(
+        "Recall (Bad)",
+        f"{metrics['recall_bad']:.4f}",
+        delta=f"{metrics['recall_bad']*100:.1f}% of defaults caught",
+        delta_color="normal" if metrics["recall_bad"] >= 0.6 else "inverse",
+        help="Of all actual defaults, what % did the model flag? Maximise this.",
+    )
+    b2.metric(
+        "Precision (Bad)",
+        f"{metrics['precision_bad']:.4f}",
+        delta=f"{metrics['precision_bad']*100:.1f}% of flagged are truly bad",
+        delta_color="normal" if metrics["precision_bad"] >= 0.4 else "off",
+        help="Of all loans flagged as bad, what % are actually bad?",
+    )
+    b3.metric(
+        "F1 (Bad)",
+        f"{metrics['f1_bad']:.4f}",
+        help="Harmonic mean of recall and precision for the bad class.",
+    )
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Defaults Caught (TP)",
+        f"{metrics['true_positives']:,}",
+        help="Correctly flagged defaults.",
+    )
+    c2.metric(
+        "Defaults Missed (FN)",
+        f"{metrics['false_negatives']:,}",
+        delta="Costly — unexpected loss",
+        delta_color="inverse",
+        help="Defaults the model failed to catch. These become unexpected losses.",
+    )
+    c3.metric(
+        "Good Loans Rejected (FP)",
+        f"{metrics['false_positives']:,}",
+        delta="Lost revenue",
+        delta_color="off",
+        help="Good borrowers incorrectly declined. These are lost interest revenue.",
+    )
+
+    st.markdown("---")
+
+    # ── Section 3: Threshold sweep table + chart ─────────────────────────────
+    st.markdown("### Threshold Analysis")
+    st.markdown(
+        "<div style='color:#7a9bb5; font-size:0.85rem; margin-bottom:16px'>"
+        "Each row is the same model evaluated at a different decision threshold. "
+        "Lowering the threshold flags more loans as bad — recall rises, precision falls. "
+        "Pick the threshold that matches your risk appetite."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    sweep_df = pd.DataFrame(metrics["threshold_sweep"])
+
+    # Chart: recall, precision, f1 vs threshold
+    fig_sweep = go.Figure()
+    fig_sweep.add_trace(go.Scatter(
+        x=sweep_df["threshold"], y=sweep_df["recall_bad"],
+        mode="lines+markers", name="Recall (Bad)",
+        line=dict(color="#ef4444", width=2.5),
+        marker=dict(size=8),
+    ))
+    fig_sweep.add_trace(go.Scatter(
+        x=sweep_df["threshold"], y=sweep_df["precision_bad"],
+        mode="lines+markers", name="Precision (Bad)",
+        line=dict(color="#3b82f6", width=2.5),
+        marker=dict(size=8),
+    ))
+    fig_sweep.add_trace(go.Scatter(
+        x=sweep_df["threshold"], y=sweep_df["f1_bad"],
+        mode="lines+markers", name="F1 (Bad)",
+        line=dict(color="#22c55e", width=2, dash="dash"),
+        marker=dict(size=8),
+    ))
+    # Mark the best threshold
+    fig_sweep.add_vline(
+        x=metrics["best_threshold"],
+        line_dash="dot", line_color="#f59e0b", line_width=1.5,
+        annotation_text=f"Best recall (t={metrics['best_threshold']})",
+        annotation_font_color="#f59e0b",
+        annotation_position="top left",
+    )
+    fig_sweep.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#080e14",
+        plot_bgcolor="#080e14",
+        xaxis_title="Threshold (min p_good to approve)",
+        yaxis_title="Score",
+        yaxis=dict(range=[0, 1.05]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=380,
+        margin=dict(t=40, b=30, l=0, r=0),
+    )
+    st.plotly_chart(fig_sweep, use_container_width=True)
+
+    # Table
+    sweep_display = sweep_df[[
+        "threshold","recall_bad","precision_bad","f1_bad",
+        "true_positives","false_negatives","false_positives"
+    ]].copy()
+    sweep_display["recall_bad"]    = sweep_display["recall_bad"].map("{:.4f}".format)
+    sweep_display["precision_bad"] = sweep_display["precision_bad"].map("{:.4f}".format)
+    sweep_display["f1_bad"]        = sweep_display["f1_bad"].map("{:.4f}".format)
+    sweep_display = sweep_display.rename(columns={
+        "threshold":       "Threshold",
+        "recall_bad":      "Recall (Bad)",
+        "precision_bad":   "Precision (Bad)",
+        "f1_bad":          "F1 (Bad)",
+        "true_positives":  "TP (Caught)",
+        "false_negatives": "FN (Missed)",
+        "false_positives": "FP (Good Rejected)",
+    })
+    st.dataframe(sweep_display, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown(
+        "<div style='font-size:0.75rem; color:#4a7fa5'>"
+        "AUC, Gini, KS are threshold-independent. "
+        "Recall / Precision / F1 shown at the best-recall threshold from the sweep. "
+        "Re-run evaluate.py to update all metrics after retraining."
         "</div>",
         unsafe_allow_html=True,
     )

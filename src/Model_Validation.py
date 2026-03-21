@@ -1,232 +1,354 @@
 """
-Model Validation Script for Credit Risk PD Model
-=================================================
-Loads the saved model and its significant feature list (produced by
-train_pd_model.py), applies identical feature selection to the test
-data, then runs a full suite of validation metrics.
+evaluate.py
+-----------
+Evaluates the trained scorecard model with a focus on bad loan detection.
+Loops over a grid of thresholds and logs each one as its own MLflow run
+so you can compare them in the UI and pick the threshold that best fits
+your risk appetite (e.g. maximise recall while keeping precision above some floor).
+
+Run: python evaluate.py
+Then: mlflow ui   (visit http://localhost:5000 → experiment "credit_scorecard")
 """
 
 import pickle
-
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-
-from sklearn.metrics import (
-    roc_curve,
-    roc_auc_score,
-    confusion_matrix,
-    accuracy_score,
-)
-from scipy.stats import ks_2samp
-
-sns.set()
-
-
-# ---------------------------------------------------------------------------
-# Paths — update these to match your environment
-# ---------------------------------------------------------------------------
+import mlflow
+import mlflow.sklearn
 from pathlib import Path
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    confusion_matrix,
+    classification_report,
+    precision_recall_curve,
+    ConfusionMatrixDisplay,
+)
+from sklearn.calibration import CalibrationDisplay
 
-SRC_DIR   = Path(__file__).resolve().parent   # .../src/
-ROOT_DIR  = SRC_DIR.parent                    # .../basel-credit-risk-model/
-DATA_DIR  = ROOT_DIR / "data"
-MODEL_DIR = SRC_DIR
+warnings.filterwarnings("ignore")
 
-INPUTS_TEST_PATH   = f"{DATA_DIR}/loan_data_inputs_test.csv"
-TARGETS_TEST_PATH  = f"{DATA_DIR}/loan_data_targets_test.csv"
-MODEL_SAVE_PATH    = f"{MODEL_DIR}/pd_model.sav"
-# Feature list saved by train_pd_model.py — contains only the columns
-# that survived the p-value filter, in the exact order the model expects
-FEATURES_SAVE_PATH = f"{MODEL_DIR}/pd_model_features.pkl"
+# ── Paths ─────────────────────────────────────────────────────────────────────
+MODEL_DIR  = Path("scorecard_outputs")
+REPORT_DIR = Path("scorecard_outputs/evaluation")
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Classification threshold (adjust as needed based on threshold-optimisation
-# output from the training script)
-THRESHOLD = 0.9
+# ── Threshold grid to sweep ───────────────────────────────────────────────────
+# Each value is the minimum p_good required to approve a loan.
+# Lower threshold = more loans flagged as bad = higher recall, lower precision.
+THRESHOLDS = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+
+# Stop the sweep as soon as recall for bad loans reaches this value.
+# Pushing beyond 0.75 typically causes precision to collapse and
+# good borrowers to be rejected at an unacceptable rate.
+RECALL_TARGET = 0.75
+
+# Scorecard scaling
+PDO             = 20
+REFERENCE_SCORE = 600
+REFERENCE_ODDS  = 1.0
+
+mlflow.set_experiment("credit_scorecard")
 
 
-# ---------------------------------------------------------------------------
-# 1. Load model and feature list
-# ---------------------------------------------------------------------------
-print("Loading model and feature list...")
+# ── 1. Load artifacts ─────────────────────────────────────────────────────────
+print("Loading artifacts...")
 
-with open(MODEL_SAVE_PATH, "rb") as f:
+with open(MODEL_DIR / "model.pkl", "rb") as f:
     model = pickle.load(f)
 
-with open(FEATURES_SAVE_PATH, "rb") as f:
-    significant_features = pickle.load(f)
+with open(MODEL_DIR / "feature_names.pkl", "rb") as f:
+    feature_names = pickle.load(f)
 
-print(f"Model loaded successfully")
-print(f"Significant features loaded: {len(significant_features)} features")
+X_test  = pd.read_csv(MODEL_DIR / "X_test.csv",  index_col=0)
+X_train = pd.read_csv(MODEL_DIR / "X_train.csv", index_col=0)
+y_test  = pd.read_csv(MODEL_DIR / "y_test.csv",  index_col=0).squeeze()
+y_train = pd.read_csv(MODEL_DIR / "y_train.csv", index_col=0).squeeze()
 
-
-# ---------------------------------------------------------------------------
-# 2. Load test data
-# ---------------------------------------------------------------------------
-print("\nLoading test data...")
-loan_data_inputs_test  = pd.read_csv(INPUTS_TEST_PATH)
-loan_data_targets_test = pd.read_csv(TARGETS_TEST_PATH)
-
-print(f"Inputs  test shape:  {loan_data_inputs_test.shape}")
-print(f"Targets test shape:  {loan_data_targets_test.shape}")
+print(f"  Test rows: {len(X_test):,}  |  Bad rate: {(y_test == 0).mean():.1%}")
 
 
-# ---------------------------------------------------------------------------
-# 3. Select features
-#    Use exactly the significant columns the training script saved — this
-#    automatically excludes both reference categories AND the features that
-#    were dropped for failing the p-value filter (p > 0.05).
-# ---------------------------------------------------------------------------
-missing = [c for c in significant_features if c not in loan_data_inputs_test.columns]
-if missing:
-    raise ValueError(
-        f"The following significant features are missing from the test data:\n{missing}"
-    )
+# ── 2. Probabilities (computed once, reused across all threshold runs) ─────────
+p_good_test  = model.predict_proba(X_test)[:, 1]
+pd_est_test  = 1 - p_good_test
+p_good_train = model.predict_proba(X_train)[:, 1]
 
-inputs_test = loan_data_inputs_test[significant_features]
-print(f"\nTest features selected: {inputs_test.shape[1]} columns")
+# Treat bad (0) as the positive class for all bad-loan metrics
+y_true_bad = (y_test == 0).astype(int)
 
+# AUC and Gini are threshold-independent — compute once
+auc  = roc_auc_score(y_test, p_good_test)
+gini = 2 * auc - 1
 
-# ---------------------------------------------------------------------------
-# 4. Generate predictions
-# ---------------------------------------------------------------------------
-y_hat_test       = model.predict(inputs_test)
-y_hat_test_proba = model.predict_proba(inputs_test)[:, 1]
+# KS statistic
+ks_df = pd.DataFrame({"y": y_test.values, "p_good": p_good_test})
+ks_df = ks_df.sort_values("p_good", ascending=False).reset_index(drop=True)
+ks_df["cum_good"] = (ks_df["y"] == 1).cumsum() / (y_test == 1).sum()
+ks_df["cum_bad"]  = (ks_df["y"] == 0).cumsum() / (y_test == 0).sum()
+ks = (ks_df["cum_good"] - ks_df["cum_bad"]).abs().max()
 
-print(f"Class predictions shape:       {y_hat_test.shape}")
-print(f"Probability predictions shape: {y_hat_test_proba.shape}")
+# Full precision-recall curve (used for the sweep plot)
+prec_curve, rec_curve, thresh_curve = precision_recall_curve(y_true_bad, pd_est_test)
+thresh_curve = np.append(thresh_curve, 1.0)
+f1_curve     = 2 * prec_curve * rec_curve / np.maximum(prec_curve + rec_curve, 1e-9)
 
+# Scorecard scores
+factor = PDO / np.log(2)
+offset = REFERENCE_SCORE - factor * np.log(REFERENCE_ODDS)
+scores_test  = (offset + factor * model.decision_function(X_test)).round(0).astype(int)
+scores_train = (offset + factor * model.decision_function(X_train)).round(0).astype(int)
 
-# ---------------------------------------------------------------------------
-# 5. Build actual-vs-predicted DataFrame
-# ---------------------------------------------------------------------------
-targets_reset = loan_data_targets_test.copy().reset_index(drop=True)
-
-df_actual_predicted_probs = pd.concat(
-    [targets_reset, pd.Series(y_hat_test_proba, name="y_hat_test_proba")],
-    axis=1,
-)
-df_actual_predicted_probs.columns = ["loan_data_targets_test", "y_hat_test_proba"]
-df_actual_predicted_probs.index   = loan_data_inputs_test.index
-
-print(f"\nActual vs Predicted DataFrame shape: {df_actual_predicted_probs.shape}")
+# PSI
+bins_psi   = np.linspace(min(scores_train.min(), scores_test.min()),
+                         max(scores_train.max(), scores_test.max()), 11)
+train_pct  = pd.cut(pd.Series(scores_train), bins=bins_psi).value_counts(sort=False, normalize=True).clip(lower=1e-4)
+test_pct   = pd.cut(pd.Series(scores_test),  bins=bins_psi).value_counts(sort=False, normalize=True).clip(lower=1e-4)
+psi        = float(((test_pct - train_pct) * np.log(test_pct / train_pct)).sum())
+psi_status = "Stable" if psi < 0.10 else ("Monitor" if psi < 0.25 else "Unstable — retrain")
 
 
-# ---------------------------------------------------------------------------
-# 6. Accuracy metrics with threshold
-# ---------------------------------------------------------------------------
-df_actual_predicted_probs["y_hat_test"] = np.where(
-    df_actual_predicted_probs["y_hat_test_proba"] > THRESHOLD, 1, 0
-)
+# ── 3. Threshold sweep — one MLflow run per threshold ─────────────────────────
+# This is the main loop. For each threshold we compute bad-loan metrics and
+# log them so the MLflow UI lets you compare all thresholds side by side.
+print(f"\nRunning threshold sweep over: {THRESHOLDS}")
+print(f"{'Threshold':<12} {'Recall':>8} {'Precision':>10} {'F1':>8} {'TP':>8} {'FN':>8} {'FP':>8}")
+print("-" * 65)
 
-cm = confusion_matrix(
-    df_actual_predicted_probs["loan_data_targets_test"],
-    df_actual_predicted_probs["y_hat_test"],
-)
-print(f"\nConfusion Matrix (threshold={THRESHOLD}):")
-print(cm)
+threshold_summary = []
 
-cm_norm = confusion_matrix(
-    df_actual_predicted_probs["loan_data_targets_test"],
-    df_actual_predicted_probs["y_hat_test"],
-    normalize="all",
-)
-print(f"\nNormalized Confusion Matrix (threshold={THRESHOLD}):")
-print(cm_norm)
+for threshold in THRESHOLDS:
+    # Flag a loan as bad when pd_est >= (1 - threshold)
+    # i.e. when the model is not confident enough that the loan is good
+    y_pred_bad = (pd_est_test >= (1 - threshold)).astype(int)
 
-accuracy = accuracy_score(
-    df_actual_predicted_probs["loan_data_targets_test"],
-    df_actual_predicted_probs["y_hat_test"],
-)
-print(f"\nAccuracy (threshold={THRESHOLD}): {accuracy:.4f}")
+    cm = confusion_matrix(y_true_bad, y_pred_bad)
+    tn, fp, fn, tp = cm.ravel()
+
+    recall_bad    = tp / (tp + fn)
+    precision_bad = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    f1_bad        = (2 * precision_bad * recall_bad) / (precision_bad + recall_bad) if (precision_bad + recall_bad) > 0 else 0.0
+
+    print(f"{threshold:<12.2f} {recall_bad:>8.4f} {precision_bad:>10.4f} {f1_bad:>8.4f} {tp:>8,} {fn:>8,} {fp:>8,}")
+
+    threshold_summary.append({
+        "threshold":    threshold,
+        "recall_bad":   round(recall_bad,    4),
+        "precision_bad": round(precision_bad, 4),
+        "f1_bad":       round(f1_bad,         4),
+        "auc":          round(auc,            4),
+        "gini":         round(gini,           4),
+        "ks":           round(ks,             4),
+        "true_positives":  int(tp),
+        "false_negatives": int(fn),
+        "false_positives": int(fp),
+        "true_negatives":  int(tn),
+    })
+
+    with mlflow.start_run(run_name=f"threshold={threshold}"):
+
+        # Parameters — what we set
+        mlflow.log_param("threshold",    threshold)
+        mlflow.log_param("n_test",       len(X_test))
+
+        # Metrics — what we measure
+        # Threshold-independent (same across all runs, but logged for easy filtering)
+        mlflow.log_metric("auc",         round(auc,          4))
+        mlflow.log_metric("gini",        round(gini,         4))
+        mlflow.log_metric("ks",          round(ks,           4))
+        mlflow.log_metric("psi",         round(psi,          4))
+
+        # Threshold-dependent bad loan metrics
+        mlflow.log_metric("recall_bad",    round(recall_bad,    4))
+        mlflow.log_metric("precision_bad", round(precision_bad, 4))
+        mlflow.log_metric("f1_bad",        round(f1_bad,        4))
+        mlflow.log_metric("true_positives",  int(tp))
+        mlflow.log_metric("false_negatives", int(fn))
+        mlflow.log_metric("false_positives", int(fp))
+
+    # Stop optimising once recall target is reached — going further
+    # collapses precision and rejects too many good borrowers.
+    if recall_bad >= RECALL_TARGET:
+        print(f"  -> Recall target {RECALL_TARGET} reached at threshold={threshold}. Stopping sweep.")
+        break
 
 
-# ---------------------------------------------------------------------------
-# 7. ROC curve and AUROC
-# ---------------------------------------------------------------------------
-fpr, tpr, _ = roc_curve(
-    df_actual_predicted_probs["loan_data_targets_test"],
-    df_actual_predicted_probs["y_hat_test_proba"],
-)
+# ── 4. Plots (saved once, not per threshold) ──────────────────────────────────
+print("\nGenerating plots...")
 
-plt.figure(figsize=(10, 6))
-plt.plot(fpr, tpr, linewidth=2)
-plt.plot(fpr, fpr, linestyle="--", color="k", alpha=0.7)
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("ROC Curve")
-plt.grid(True, alpha=0.3)
-plt.show()
-
-AUROC = roc_auc_score(
-    df_actual_predicted_probs["loan_data_targets_test"],
-    df_actual_predicted_probs["y_hat_test_proba"],
-)
-print(f"AUROC: {AUROC:.4f}")
-
-
-# ---------------------------------------------------------------------------
-# 8. Gini coefficient
-# ---------------------------------------------------------------------------
-Gini = AUROC * 2 - 1
-print(f"Gini Coefficient: {Gini:.4f}")
-
-
-# ---------------------------------------------------------------------------
-# 9. Kolmogorov-Smirnov statistic
-# ---------------------------------------------------------------------------
-good_probs = df_actual_predicted_probs[
-    df_actual_predicted_probs["loan_data_targets_test"] == 0
-]["y_hat_test_proba"]
-
-bad_probs = df_actual_predicted_probs[
-    df_actual_predicted_probs["loan_data_targets_test"] == 1
-]["y_hat_test_proba"]
-
-ks_statistic, _ = ks_2samp(good_probs, bad_probs)
-print(f"KS Statistic: {ks_statistic:.4f}")
+# ROC curve
+fpr, tpr, _ = roc_curve(y_test, p_good_test)
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.plot(fpr, tpr, lw=2, label=f"AUC = {auc:.4f}")
+ax.plot([0, 1], [0, 1], "k--", lw=1)
+ax.set_xlabel("False Positive Rate")
+ax.set_ylabel("True Positive Rate")
+ax.set_title("ROC Curve")
+ax.legend()
+ax.grid(alpha=0.3)
+fig.savefig(REPORT_DIR / "roc_curve.png", dpi=150, bbox_inches="tight")
+plt.close()
 
 # KS chart
-df_sorted   = df_actual_predicted_probs.sort_values("y_hat_test_proba").reset_index(drop=True)
-total_pop   = df_sorted.shape[0]
-total_good  = (df_sorted["loan_data_targets_test"] == 0).sum()
-total_bad   = (df_sorted["loan_data_targets_test"] == 1).sum()
+fig, ax = plt.subplots(figsize=(7, 5))
+x_axis = ks_df.index / len(ks_df)
+ax.plot(x_axis, ks_df["cum_good"], label="Cumulative Good")
+ax.plot(x_axis, ks_df["cum_bad"],  label="Cumulative Bad")
+ks_idx = (ks_df["cum_good"] - ks_df["cum_bad"]).abs().idxmax()
+ax.axvline(ks_idx / len(ks_df), color="red", linestyle="--", label=f"KS = {ks:.4f}")
+ax.set_xlabel("Population fraction (sorted by score)")
+ax.set_ylabel("Cumulative rate")
+ax.set_title("KS Chart")
+ax.legend()
+ax.grid(alpha=0.3)
+fig.savefig(REPORT_DIR / "ks_chart.png", dpi=150, bbox_inches="tight")
+plt.close()
 
-df_sorted["Cumulative Perc Good"] = (
-    (df_sorted["loan_data_targets_test"] == 0).cumsum() / total_good
+# Precision / Recall for bad loans — all thresholds on one chart
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.plot(thresh_curve, rec_curve,  color="#e74c3c", lw=2, label="Recall (Bad) — % defaults caught")
+ax.plot(thresh_curve, prec_curve, color="#2980b9", lw=2, label="Precision (Bad)")
+ax.plot(thresh_curve, f1_curve,   color="#27ae60", lw=1.5, linestyle="--", label="F1 (Bad)")
+
+# Mark each threshold from our grid
+colors = plt.cm.Oranges(np.linspace(0.4, 1.0, len(THRESHOLDS)))
+for i, t in enumerate(THRESHOLDS):
+    pd_t = 1 - t
+    # Find the index in thresh_curve closest to pd_t
+    idx = np.argmin(np.abs(thresh_curve - pd_t))
+    ax.axvline(pd_t, color=colors[i], linestyle=":", lw=1.2, alpha=0.8)
+    ax.annotate(
+        f"t={t}",
+        xy=(pd_t, 0.05 + i * 0.07),
+        fontsize=8, color=colors[i], ha="center",
+    )
+
+ax.set_xlabel("PD Threshold  (raise = stricter, fewer approvals)")
+ax.set_ylabel("Score")
+ax.set_title("Precision & Recall for Bad Loans — All Thresholds")
+ax.legend(loc="center right")
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1.05)
+ax.grid(alpha=0.3)
+fig.savefig(REPORT_DIR / "precision_recall_bad.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Confusion matrix at threshold = 0.5 for reference
+y_pred_ref = (p_good_test >= 0.5).astype(int)
+fig, ax = plt.subplots(figsize=(5, 4))
+ConfusionMatrixDisplay.from_predictions(y_test, y_pred_ref, ax=ax, colorbar=False)
+ax.set_title("Confusion Matrix (threshold=0.5)")
+fig.savefig(REPORT_DIR / "confusion_matrix.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Calibration plot
+fig, ax = plt.subplots(figsize=(6, 5))
+CalibrationDisplay.from_predictions(
+    (y_test == 0).astype(int), pd_est_test,
+    n_bins=10, ax=ax, name="Model",
 )
-df_sorted["Cumulative Perc Bad"] = (
-    (df_sorted["loan_data_targets_test"] == 1).cumsum() / total_bad
+ax.set_title("Calibration Plot (PD)")
+fig.savefig(REPORT_DIR / "calibration_plot.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Score distribution — train vs test
+fig, ax = plt.subplots(figsize=(8, 5))
+bins_hist = np.linspace(min(scores_train.min(), scores_test.min()),
+                        max(scores_train.max(), scores_test.max()), 40)
+ax.hist(scores_train, bins=bins_hist, alpha=0.5, density=True, label="Train")
+ax.hist(scores_test,  bins=bins_hist, alpha=0.5, density=True, label="Test")
+ax.set_xlabel("Scorecard Score")
+ax.set_ylabel("Density")
+ax.set_title("Score Distribution — Train vs Test")
+ax.legend()
+ax.grid(alpha=0.3)
+fig.savefig(REPORT_DIR / "score_distribution.png", dpi=150, bbox_inches="tight")
+plt.close()
+
+# Log all plots as artifacts into one final summary MLflow run
+with mlflow.start_run(run_name="evaluation_summary"):
+    mlflow.log_metric("auc",  round(auc,  4))
+    mlflow.log_metric("gini", round(gini, 4))
+    mlflow.log_metric("ks",   round(ks,   4))
+    mlflow.log_metric("psi",  round(psi,  4))
+    for plot_file in REPORT_DIR.glob("*.png"):
+        mlflow.log_artifact(str(plot_file))
+
+
+# ── 5. Save model_metrics.pkl for the Streamlit app ──────────────────────────
+# Pick the first row that meets the recall target; if target was never reached
+# (model isn't powerful enough), fall back to the row with the highest recall.
+rows_at_target = [r for r in threshold_summary if r["recall_bad"] >= RECALL_TARGET]
+best_row = rows_at_target[0] if rows_at_target else max(threshold_summary, key=lambda r: r["recall_bad"])
+
+model_metrics = {
+    "auc":           round(auc,        4),
+    "gini":          round(gini,       4),
+    "ks":            round(ks,         4),
+    "psi":           round(psi,        4),
+    "psi_status":    psi_status,
+    "recall_bad":    best_row["recall_bad"],
+    "precision_bad": best_row["precision_bad"],
+    "f1_bad":        best_row["f1_bad"],
+    "best_threshold": best_row["threshold"],
+    "true_positives":  best_row["true_positives"],
+    "false_negatives": best_row["false_negatives"],
+    "false_positives": best_row["false_positives"],
+    "threshold_sweep": threshold_summary,   # full sweep so app can render the table
+    "recall_target":  RECALL_TARGET,
+}
+with open(MODEL_DIR / "model_metrics.pkl", "wb") as f:
+    pickle.dump(model_metrics, f)
+print(f"Saved model_metrics.pkl → {MODEL_DIR / 'model_metrics.pkl'}")
+
+# ── 5b. Save CSVs ─────────────────────────────────────────────────────────────
+thresh_summary_df = pd.DataFrame(threshold_summary)
+thresh_summary_df.to_csv(REPORT_DIR / "threshold_sweep.csv", index=False)
+
+pd.DataFrame(
+    classification_report(y_test, y_pred_ref, output_dict=True)
+).T.round(4).to_csv(REPORT_DIR / "classification_report.csv")
+
+pd.DataFrame({
+    "feature":     feature_names,
+    "coefficient": model.coef_[0].round(6),
+    "points_per_unit_woe": (factor * model.coef_[0]).round(2),
+}).sort_values("points_per_unit_woe", ascending=False).reset_index(drop=True).to_csv(
+    REPORT_DIR / "scorecard_points.csv", index=False
 )
 
-plt.figure(figsize=(10, 6))
-plt.plot(df_sorted["y_hat_test_proba"], df_sorted["Cumulative Perc Bad"],
-         color="r", linewidth=2, label="Bad")
-plt.plot(df_sorted["y_hat_test_proba"], df_sorted["Cumulative Perc Good"],
-         color="b", linewidth=2, label="Good")
-plt.xlabel("Estimated Probability for being Good")
-plt.ylabel("Cumulative %")
-plt.title("Kolmogorov-Smirnov Chart")
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.show()
+print(f"\nAll reports saved to: {REPORT_DIR.resolve()}")
 
 
-# ---------------------------------------------------------------------------
-# 10. Summary
-# ---------------------------------------------------------------------------
-print("\n" + "=" * 50)
-print("MODEL VALIDATION SUMMARY")
-print("=" * 50)
-print(f"Test Set Size:          {total_pop}")
-print(f"Number of Features:     {inputs_test.shape[1]}")
-print(f"Good Loans (0):         {total_good}")
-print(f"Bad Loans  (1):         {total_bad}")
-print(f"Bad Rate:               {total_bad / total_pop:.4f}")
-print("-" * 50)
-print(f"AUROC:                  {AUROC:.4f}")
-print(f"Gini Coefficient:       {Gini:.4f}")
-print(f"KS Statistic:           {ks_statistic:.4f}")
-print(f"Accuracy (thr={THRESHOLD}):   {accuracy:.4f}")
-print("=" * 50)
+# ── 6. Print summary ──────────────────────────────────────────────────────────
+print("\n" + "=" * 65)
+print("  EVALUATION REPORT")
+print("=" * 65)
+
+print(f"\n  Discrimination (threshold-independent)")
+print(f"    AUC   : {auc:.4f}")
+print(f"    Gini  : {gini:.4f}  {'OK' if gini > 0.3 else 'Below 0.30 threshold'}")
+print(f"    KS    : {ks:.4f}  {'OK' if ks > 0.2 else 'Below 0.20 threshold'}")
+
+print(f"\n  Stability")
+print(f"    PSI   : {psi:.4f}  — {psi_status}")
+
+print(f"\n  Bad Loan Detection by Threshold")
+print(f"  {'Threshold':<12} {'Recall':>8} {'Precision':>10} {'F1':>8} {'Defaults caught':>16} {'Defaults missed':>16}")
+print("  " + "-" * 70)
+for row in threshold_summary:
+    print(
+        f"  {row['threshold']:<12.2f}"
+        f" {row['recall_bad']:>8.4f}"
+        f" {row['precision_bad']:>10.4f}"
+        f" {row['f1_bad']:>8.4f}"
+        f" {row['true_positives']:>16,}"
+        f" {row['false_negatives']:>16,}"
+    )
+
+print(f"\n  Recall target        : {RECALL_TARGET}  (sweep stops when this is reached)")
+print(f"  Best threshold chosen: {best_row['threshold']}  (recall={best_row['recall_bad']})")
+print(f"  -> In MLflow UI, sort runs by recall_bad to compare thresholds.")
+print(f"  -> Run:  mlflow ui")
+print("=" * 65)
