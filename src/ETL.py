@@ -9,7 +9,7 @@ for logistic regression scorecard development.
 Pipeline stages
 ---------------
 1.  Data cleaning & target creation
-2.  Variable binning  (numerical → quantile / monotonic; categorical → grouped)
+2.  Variable binning  (numerical quantile / monotonic; categorical → grouped)
 3.  WoE & IV computation
 4.  Feature selection  (IV thresholds + correlation filter)
 5.  WoE transformation of the dataset
@@ -135,13 +135,13 @@ def clean_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     """
     Perform light cleaning and return (feature_df, target_series).
 
-    •  Numeric columns: left as-is; missing values are handled at binning time
+      Numeric columns: left as-is; missing values are handled at binning time
        (they receive their own "Missing" bin).
-    •  Categorical columns: missing values filled with the string "Missing" so
+     Categorical columns: missing values filled with the string "Missing" so
        they are treated as a distinct category.
-    •  Columns with > 95% missing are dropped entirely.
-    •  Constant columns are dropped.
-    •  The original loan_status column is dropped (it was used to build the target).
+      Columns with > 95% missing are dropped entirely.
+     Constant columns are dropped.
+     The original loan_status column is dropped (it was used to build the target).
     """
     df = df.copy()
 
@@ -190,7 +190,7 @@ def clean_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 # ============================================================================
 
 def _coerce_numeric(series: pd.Series) -> pd.Series:
-    """Try to parse a column as numeric; return original if it fails."""
+    """ Try to parse a column as numeric; return original if it fails. """
     try:
         return pd.to_numeric(series, errors="raise")
     except (ValueError, TypeError):
@@ -198,7 +198,7 @@ def _coerce_numeric(series: pd.Series) -> pd.Series:
 
 
 def _group_rare_categories(series: pd.Series, threshold: float = RARE_CATEGORY_THRESHOLD) -> pd.Series:
-    """Replace infrequent categories (below threshold) with 'Other'."""
+    """ Replace infrequent categories (below threshold) with 'Other' . """
     freq = series.value_counts(normalize=True, dropna=False)
     rare = freq[freq < threshold].index
     return series.where(~series.isin(rare), other="Other")
@@ -365,13 +365,13 @@ def compute_woe_iv(
     Compute WoE and IV for a single binned variable.
 
     Convention used here:
-        y = 1  →  Good  (non-default)
-        y = 0  →  Bad   (default)
+        y = 1    Good  (non-default)
+        y = 0   Bad   (default)
 
     WoE_bin = ln( P(Good | bin) / P(Bad | bin) )
             = ln( (n_good_bin / N_good) / (n_bad_bin / N_bad) )
 
-    IV = Σ  (pct_good_bin − pct_bad_bin) × WoE_bin
+    (pct_good_bin − pct_bad_bin) × WoE_bin
 
     Returns
     -------
@@ -687,21 +687,21 @@ def validate_and_report(
     # --- NaN check
     nan_counts = X_woe.isnull().sum()
     assert nan_counts.sum() == 0, f"NaNs found in X_woe:\n{nan_counts[nan_counts > 0]}"
-    print("\n  ✓  No NaN values in X_woe")
+    print("\n   No NaN values in X_woe")
 
     # --- Numeric check
     non_numeric = [c for c in X_woe.columns if not pd.api.types.is_numeric_dtype(X_woe[c])]
     assert len(non_numeric) == 0, f"Non-numeric columns found: {non_numeric}"
-    print("  ✓  All features are numeric")
+    print("   All features are numeric")
 
     # --- Target alignment
     assert len(X_woe) == len(y), "X_woe and y row counts do not match!"
     assert set(y.unique()).issubset({0, 1}), "Target is not binary!"
-    print("  ✓  Target aligned and binary")
+    print("    Target aligned and binary")
 
     # --- Flagged features
     if flagged_features:
-        print(f"\n  ⚠  Flagged (weak IV, kept): {flagged_features}")
+        print(f"\n   Flagged (weak IV, kept): {flagged_features}")
 
     # --- Top 10 by IV
     top10 = iv_summary[iv_summary["feature"].isin(X_woe.columns)].head(10)
@@ -712,7 +712,7 @@ def validate_and_report(
     )
     print("\n" + "=" * 65 + "\n")
 
-    log.info("Validation passed ✓")
+    log.info("Validation passed ")
 
 
 # ============================================================================
@@ -728,7 +728,7 @@ def load_woe_artifacts(
     Returns
     -------
     woe_tables        : {feature: woe_table}
-    selected_features : list[str]
+    selected_features: list[str]
     """
     with open(out_dir / "woe_mappings.pkl", "rb") as fh:
         woe_tables: dict[str, pd.DataFrame] = pickle.load(fh)
@@ -753,12 +753,12 @@ def transform_inference(
 
     Parameters
     ----------
-    X_new             : raw feature DataFrame (same schema as training data)
-    woe_tables        : loaded via load_woe_artifacts()
+    X_new            : raw feature DataFrame (same schema as training data)
+    woe_tables       : loaded via load_woe_artifacts()
     selected_features : loaded via load_woe_artifacts()
-    is_numeric        : optional dict from training-time bin_all_variables()
+    is_numeric      : optional dict from training-time bin_all_variables()
                         (if None, dtype is inferred from X_new)
-    y_new             : optional target; only used for binning monotonicity if
+    y_new            : optional target; only used for binning monotonicity if
                         is_numeric is provided
 
     Returns
