@@ -1,0 +1,10 @@
+artifact_location: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/427047255040576077/models/m-1220ba5f58524017a8bde2aaf3d99d4a/artifacts
+creation_timestamp: 1776757921176
+experiment_id: '427047255040576077'
+last_updated_timestamp: 1776757926643
+model_id: m-1220ba5f58524017a8bde2aaf3d99d4a
+model_type: null
+name: xgb_model
+source_run_id: ea36ec18d35b4df49cb524a613942413
+status: 2
+status_message: null

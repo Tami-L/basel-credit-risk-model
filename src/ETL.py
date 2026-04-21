@@ -283,7 +283,7 @@ def _enforce_monotonic_bins(
         # Find the pair of adjacent bins with the smallest bad_rate difference
         # and merge them
         rates = stats["bad_rate"].values
-        idx   = stats.index.tolist()
+        idx = stats.index.tolist()
 
         if len(idx) < 2:
             break
@@ -635,12 +635,12 @@ def save_artifacts(
 
     # 1. WoE dataset
     xwoe_path = out_dir / "X_woe.csv"
-    X_woe.to_csv(xwoe_path, index=True)
+    X_woe.to_csv(xwoe_path, index=False)
     log.info("Saved X_woe      → %s  (%d rows × %d cols)", xwoe_path, *X_woe.shape)
 
     # 2. Target
     y_path = out_dir / "y.csv"
-    y.to_frame(name=TARGET_COL).to_csv(y_path, index=True)
+    y.to_frame(name=TARGET_COL).to_csv(y_path, index=False)
     log.info("Saved y          → %s", y_path)
 
     # 3. WoE mappings (full woe_tables dict)

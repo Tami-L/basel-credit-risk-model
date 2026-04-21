@@ -1,0 +1,14 @@
+artifact_uri: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/427047255040576077/5e038dbb963343168179798461edd53a/artifacts
+end_time: 1776704533665
+entry_point_name: ''
+experiment_id: '427047255040576077'
+lifecycle_stage: active
+run_id: 5e038dbb963343168179798461edd53a
+run_name: xgb_trial_31
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1776704533618
+status: 3
+tags: []
+user_id: lindokuhletami

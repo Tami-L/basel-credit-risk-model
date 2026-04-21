@@ -1,0 +1,22 @@
+artifact_path: file:///Users/lindokuhletami/Desktop/Space/basel-credit-risk-model/src/mlruns/427047255040576077/models/m-5cd6f5dc78b7403592691f9f4151a737/artifacts
+flavors:
+  python_function:
+    data: model.ubj
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.12.2
+  xgboost:
+    code: null
+    data: model.ubj
+    model_class: xgboost.sklearn.XGBClassifier
+    model_format: ubj
+    xgb_version: 3.2.0
+mlflow_version: 3.10.1
+model_id: m-5cd6f5dc78b7403592691f9f4151a737
+model_size_bytes: 208913
+model_uuid: m-5cd6f5dc78b7403592691f9f4151a737
+prompts: null
+run_id: 328e0e64d5e0484881035d43ea518268
+utc_time_created: '2026-04-21 05:47:28.797534'
