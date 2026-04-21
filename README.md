@@ -14,8 +14,8 @@
 | Metric | Logistic Regression (WOE) | XGBoost (WOE features) | Basel II IRB Minimum | Status |
 |---|---|---|---|---|
 | **AUC** | 69| 71,03 | ≥ 0.70 | Run pipeline to populate |
-| **Gini** | — | 42.07 | ≥ 0.40 | Run pipeline to populate |
-| **KS Statistic** | — | 30.28| ≥ 0.30 | Run pipeline to populate |
+| **Gini** | 37 | 42.07 | ≥ 0.40 | Run pipeline to populate |
+| **KS Statistic** | 27 | 30.28| ≥ 0.30 | Run pipeline to populate |
 | **PSI (stability)** | — | — | < 0.10 (stable) | Run pipeline to populate |
 
 ---
