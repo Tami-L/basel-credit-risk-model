@@ -75,22 +75,21 @@ OUTPUT_DIR = Path("scorecard_outputs")
 # Under Basel II IRB and the SA NCA, a PD model must be based solely on
 # information available at origination.
 ORIGINATION_FEATURES = {
-    # Loan terms agreed at origination
-    "loan_amnt", "funded_amnt", "funded_amnt_inv", "term", "int_rate",
-    "installment", "grade", "sub_grade",
-    # Borrower profile at application
-    "emp_title", "emp_length", "home_ownership", "annual_inc",
-    "verification_status", "purpose", "title", "desc",
-    # Bureau / credit file at application
-    "dti", "delinq_2yrs", "inq_last_6mths", "mths_since_last_delinq",
-    "mths_since_last_record", "open_acc", "pub_rec", "revol_bal",
-    "revol_util", "total_acc", "initial_list_status",
-    "mths_since_last_major_derog", "collections_12_mths_ex_med",
-    "acc_now_delinq", "tot_coll_amt", "tot_cur_bal", "total_rev_hi_lim",
-    # Dates available at origination
-    "issue_d", "earliest_cr_line",
-    # Geography
-    "addr_state",
+    # 1. Loan Terms (Fixed at contract)
+    "loan_amnt", "term", "int_rate", "installment", "sub_grade",
+    
+    # 2. Borrower Demographics & Capacity
+    "emp_length", "home_ownership", "annual_inc", "verification_status", 
+    "purpose", "addr_state", "dti",
+    
+    # 3. Credit Bureau Snapshot (At time of App)
+    "fico_range_high", "fico_range_low", # The heavy hitters
+    "delinq_2yrs", "inq_last_6mths", "open_acc", "pub_rec", 
+    "revol_bal", "revol_util", "total_acc",
+    
+    # 4. Derogatory Information (Static at App)
+    "mths_since_last_delinq", "mths_since_last_record", 
+    "mths_since_last_major_derog",
 }
 
 
