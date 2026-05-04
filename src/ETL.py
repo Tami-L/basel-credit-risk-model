@@ -54,13 +54,13 @@ IV_WEAK_BELOW = 0.1         # flagged but optionally kept
 IV_STRONG_GTE = 0.1         # strong — always kept
 
 # Binning params
-DEFAULT_N_BINS = 10         # quantile bins before monotonicity merging
-MIN_BIN_OBS = 50            # minimum observations per bin (absolute)
+DEFAULT_N_BINS = 15         # quantile bins before monotonicity merging
+MIN_BIN_OBS = 40            # minimum observations per bin (absolute)
 MIN_BIN_PCT = 0.05          # minimum observations per bin (fraction of total)
 RARE_CATEGORY_THRESHOLD = 0.02   # group categories below this frequency → "Other"
 
 # Correlation threshold
-CORR_THRESHOLD = 0.70
+CORR_THRESHOLD = 0.7
 
 # WoE clipping (avoid ±inf from empty event / non-event bins)
 WOE_CLIP = 3.0
