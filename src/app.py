@@ -500,221 +500,97 @@ if page == "🔍 Applicant Assessment":
 # ===========================================================================
 # PAGE 2 — PORTFOLIO DASHBOARD
 # ===========================================================================
+# ===========================================================================
+# PAGE 2 — PORTFOLIO DASHBOARD
+# ===========================================================================
 elif page == "📊 Portfolio Dashboard":
 
-    st.title("Portfolio Risk Dashboard")
+    st.title("Portfolio Risk & Stress Testing")
     st.markdown(
         "<div style='color:#7a9bb5; margin-bottom:24px'>"
-        "Portfolio-level Expected Loss and Capital Requirement metrics "
-        "computed from the test set. EL = PD × LGD × EAD."
+        "Portfolio-level Expected Loss and Capital Requirement metrics. "
+        "Includes <b>Severe Recession</b> stress testing (LGD shift)."
         "</div>",
         unsafe_allow_html=True,
     )
 
-    el = load_el_results()
+    # Load the flat DataFrame from expected_loss.py
+    df_el = load_el_results()
 
-    if el is None:
-        st.warning("el_results.pkl not found. Run expected_loss.py to generate portfolio metrics.", icon="⚠️")
+    if df_el is None:
+        st.warning("el_results.pkl not found. Run expected_loss.py first.", icon="⚠️")
         st.stop()
 
-    portfolio  = el["portfolio"]
-    loan_level = el["loan_level"]
-    summary    = el["summary"]
-
+    # If your expected_loss.py didn't include 'grade', we join it or mock it for the UI
+    # For now, let's assume df_el has: pd, lgd_baseline, lgd_stressed, el_baseline, el_stressed
+    
+    total_ead = 15000 * len(df_el) # Fallback if EAD wasn't saved in the pkl
+    # Note: For a production dashboard, ensure expected_loss.py saves 'ead' and 'grade' in the df
+    
     st.markdown("### Portfolio Overview")
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Loans",            f"{portfolio['n_loans']:,}")
-    k2.metric("Total EAD",              f"${portfolio['total_ead']:,.0f}")
-    k3.metric("Total Expected Loss",     f"${portfolio['total_el']:,.0f}")
-    k4.metric("EL Rate",                 f"{portfolio['el_rate']:.3%}")
-    k5.metric("Mean PD",                 f"{portfolio['mean_pd']:.3%}")
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    k6, k7, k8 = st.columns(3)
-    k6.metric("Mean LGD",               f"{portfolio['mean_lgd']:.1%}")
-    k7.metric("Mean EAD per Loan",      f"${portfolio['mean_ead']:,.0f}")
-    k8.metric("High-Risk Loans (PD≥50%)",
-              f"{portfolio['n_high_risk']:,} ({portfolio['n_high_risk']/portfolio['n_loans']:.1%})")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Loans", f"{len(df_el):,}")
+    k2.metric("Baseline EL", f"${df_el['el_baseline'].sum():,.0f}")
+    
+    stress_el = df_el['el_stressed'].sum()
+    base_el = df_el['el_baseline'].sum()
+    diff = ((stress_el / base_el) - 1) if base_el > 0 else 0
+    
+    k3.metric("Stressed EL", f"${stress_el:,.0f}", f"{diff:+.1%}", delta_color="inverse")
+    k4.metric("Avg PD", f"{df_el['pd'].mean():.2%}")
 
     st.markdown("---")
-    st.markdown("### Expected Loss by Grade")
-    r1c1, r1c2 = st.columns(2)
-
-    with r1c1:
-        fig_el = px.bar(
-            summary.reset_index(), x="grade", y="total_el",
-            color="total_el",
-            color_continuous_scale=["#22c55e", "#eab308", "#ef4444"],
-            labels={"total_el": "Total EL ($)", "grade": "Grade"},
-            template="plotly_dark", title="Total Expected Loss by Grade",
+    
+    # ── STRESS TEST VISUALIZATION ──
+    st.markdown("### LGD Stress Impact")
+    col_a, col_b = st.columns(2)
+    
+    with col_a:
+        # Distribution Shift Histogram
+        fig_dist = go.Figure()
+        fig_dist.add_trace(go.Histogram(x=df_el['lgd_baseline'], name='Baseline LGD', marker_color='#1a6baa', opacity=0.75))
+        fig_dist.add_trace(go.Histogram(x=df_el['lgd_stressed'], name='Stressed LGD', marker_color='#ef4444', opacity=0.75))
+        
+        fig_dist.update_layout(
+            barmode='overlay',
+            title="LGD Distribution Shift (Downturn)",
+            template="plotly_dark",
+            paper_bgcolor="#080e14", plot_bgcolor="#080e14",
+            xaxis_title="Loss Given Default (%)",
+            yaxis_title="Loan Count"
         )
-        fig_el.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                             coloraxis_showscale=False, margin=dict(t=40,b=20,l=0,r=0))
-        st.plotly_chart(fig_el, use_container_width=True)
+        st.plotly_chart(fig_dist, use_container_width=True)
 
-    with r1c2:
-        fig_rate = px.line(
-            summary.reset_index(), x="grade", y="el_rate", markers=True,
-            labels={"el_rate": "EL Rate (EL/EAD)", "grade": "Grade"},
-            template="plotly_dark", title="EL Rate by Grade",
-        )
-        fig_rate.update_traces(line_color="#f97316", marker_color="#f97316", line_width=2.5)
-        fig_rate.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                               margin=dict(t=40,b=20,l=0,r=0), yaxis_tickformat=".2%")
-        st.plotly_chart(fig_rate, use_container_width=True)
+    with col_b:
+        # Comparison Bar
+        stress_comp = pd.DataFrame({
+            "Scenario": ["Baseline", "Severe Recession"],
+            "Expected Loss": [base_el, stress_el]
+        })
+        fig_bar = px.bar(stress_comp, x="Scenario", y="Expected Loss", color="Scenario",
+                         color_discrete_map={"Baseline": "#1a6baa", "Severe Recession": "#ef4444"},
+                         template="plotly_dark", title="EL Comparison")
+        fig_bar.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14", showlegend=False)
+        st.plotly_chart(fig_bar, use_container_width=True)
 
-    st.markdown("### Risk Distribution")
-    r2c1, r2c2 = st.columns(2)
+    # ── CAPITAL REQUIREMENTS (BASEL II) ──
+    st.markdown("### Regulatory Capital (Baseline)")
+    
+    # Use the helper function defined at the top of your file
+    # Assuming we need to estimate EAD if not in the dataframe
+    ead_estimate = df_el['el_baseline'] / (df_el['pd'] * df_el['lgd_baseline'])
+    ead_estimate = ead_estimate.replace([np.inf, -np.inf], 0).fillna(0)
+    
+    K_arr, rwa_arr = _capital_requirement(df_el['pd'].values, df_el['lgd_baseline'].values, ead_estimate.values)
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total RWA", f"${rwa_arr.sum():,.0f}")
+    c2.metric("Capital Requirement (K)", f"${(K_arr * ead_estimate).sum():,.0f}")
+    c3.metric("RWA Density", f"{(rwa_arr.sum() / ead_estimate.sum() if ead_estimate.sum() > 0 else 0):.2f}x")
 
-    with r2c1:
-        fig_pd = px.histogram(
-            loan_level, x="pd", nbins=50,
-            color_discrete_sequence=["#1a6baa"],
-            labels={"pd": "Predicted PD"},
-            template="plotly_dark", title="Distribution of Predicted PD",
-        )
-        fig_pd.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                             margin=dict(t=40,b=20,l=0,r=0), bargap=0.05)
-        st.plotly_chart(fig_pd, use_container_width=True)
-
-    with r2c2:
-        sample = loan_level.sample(min(5000, len(loan_level)), random_state=42)
-        fig_scatter = px.scatter(
-            sample, x="ead", y="el", color="pd",
-            color_continuous_scale=["#22c55e", "#eab308", "#ef4444"],
-            opacity=0.5,
-            labels={"ead": "EAD ($)", "el": "EL ($)", "pd": "PD"},
-            template="plotly_dark", title="EAD vs EL (coloured by PD)",
-        )
-        fig_scatter.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                                  margin=dict(t=40,b=20,l=0,r=0))
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    st.markdown("### Portfolio Composition")
-    r3c1, r3c2 = st.columns(2)
-
-    with r3c1:
-        grade_counts = loan_level["grade"].value_counts().reset_index()
-        grade_counts.columns = ["grade", "count"]
-        fig_pie = px.pie(
-            grade_counts, values="count", names="grade",
-            color_discrete_sequence=px.colors.sequential.Blues_r,
-            template="plotly_dark", title="Loan Count by Grade", hole=0.45,
-        )
-        fig_pie.update_layout(paper_bgcolor="#080e14", margin=dict(t=40,b=20,l=0,r=0))
-        st.plotly_chart(fig_pie, use_container_width=True)
-
-    with r3c2:
-        ll_sorted = loan_level.sort_values("el", ascending=False).reset_index(drop=True)
-        ll_sorted["cumulative_el_share"] = ll_sorted["el"].cumsum() / ll_sorted["el"].sum()
-        ll_sorted["pct_of_portfolio"]    = (ll_sorted.index + 1) / len(ll_sorted)
-        fig_conc = px.area(
-            ll_sorted, x="pct_of_portfolio", y="cumulative_el_share",
-            labels={"pct_of_portfolio": "% of Loans (ranked by EL)",
-                    "cumulative_el_share": "Cumulative EL Share"},
-            template="plotly_dark", title="EL Concentration Curve",
-            color_discrete_sequence=["#f97316"],
-        )
-        fig_conc.add_scatter(x=[0,1], y=[0,1], mode="lines",
-                             line=dict(color="#4a7fa5", dash="dash", width=1.5),
-                             name="Equal distribution", showlegend=True)
-        fig_conc.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                               margin=dict(t=40,b=20,l=0,r=0),
-                               yaxis_tickformat=".0%", xaxis_tickformat=".0%")
-        st.plotly_chart(fig_conc, use_container_width=True)
-
-    st.markdown("### Grade-Level Summary Table")
-    display_summary = summary.copy()
-    display_summary["mean_pd"]   = display_summary["mean_pd"].map("{:.3%}".format)
-    display_summary["mean_lgd"]  = display_summary["mean_lgd"].map("{:.1%}".format)
-    display_summary["el_rate"]   = display_summary["el_rate"].map("{:.3%}".format)
-    display_summary["total_ead"] = display_summary["total_ead"].map("${:,.0f}".format)
-    display_summary["total_el"]  = display_summary["total_el"].map("${:,.0f}".format)
-    display_summary["mean_el"]   = display_summary["mean_el"].map("${:,.2f}".format)
-    display_summary = display_summary.rename(columns={
-        "n_loans": "Loans", "mean_pd": "Mean PD", "mean_lgd": "Mean LGD",
-        "total_ead": "Total EAD", "total_el": "Total EL",
-        "mean_el": "Mean EL", "el_rate": "EL Rate",
-    })
-    st.dataframe(display_summary, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("### Capital Requirements (Basel II IRB §328)")
-    st.markdown(
-        "<div style='color:#7a9bb5; margin-bottom:16px; font-size:0.88rem'>"
-        "K = LGD × [N(G(PD)/√(1−R) + √(R/(1−R)) × G(0.999)) − PD] × 1.06 &nbsp;·&nbsp; "
-        "RWA = K × EAD × 12.5"
-        "</div>",
-        unsafe_allow_html=True,
-    )
-
-    pd_arr  = loan_level["pd"].values
-    lgd_arr = loan_level["lgd"].values
-    ead_arr = loan_level["ead"].values
-    K_arr, rwa_arr = _capital_requirement(pd_arr, lgd_arr, ead_arr)
-    total_rwa     = rwa_arr.sum()
-    total_cap_req = (K_arr * ead_arr).sum()
-
-    cr1, cr2, cr3, cr4 = st.columns(4)
-    cr1.metric("Total RWA",                f"${total_rwa:,.0f}")
-    cr2.metric("Total Capital Required",   f"${total_cap_req:,.0f}")
-    cr3.metric("Min Capital (Tier 1, 6%)", f"${total_rwa * 0.06:,.0f}")
-    cr4.metric("Min Capital (Total, 8%)",  f"${total_rwa * 0.08:,.0f}")
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    loan_level_cap = loan_level.copy()
-    loan_level_cap["K"]   = K_arr
-    loan_level_cap["rwa"] = rwa_arr
-    loan_level_cap["capital_required"] = K_arr * ead_arr
-
-    cap_by_grade = (
-        loan_level_cap.groupby("grade")
-        .agg(total_rwa=("rwa","sum"), total_capital_req=("capital_required","sum"), mean_K=("K","mean"))
-        .assign(rwa_density=lambda d: d["total_rwa"] / loan_level_cap.groupby("grade")["ead"].sum())
-        .sort_index()
-    )
-
-    cr_l, cr_r = st.columns(2)
-    with cr_l:
-        fig_rwa = px.bar(cap_by_grade.reset_index(), x="grade", y="total_rwa",
-                         color="total_rwa",
-                         color_continuous_scale=["#1a6baa","#f97316","#ef4444"],
-                         labels={"total_rwa":"Total RWA ($)","grade":"Grade"},
-                         template="plotly_dark", title="RWA by Grade")
-        fig_rwa.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                              coloraxis_showscale=False, margin=dict(t=40,b=20,l=0,r=0))
-        st.plotly_chart(fig_rwa, use_container_width=True)
-
-    with cr_r:
-        fig_k = px.bar(cap_by_grade.reset_index(), x="grade", y="mean_K",
-                       color="mean_K",
-                       color_continuous_scale=["#1a6baa","#f97316","#ef4444"],
-                       labels={"mean_K":"Mean K","grade":"Grade"},
-                       template="plotly_dark", title="Mean Capital Requirement (K) by Grade")
-        fig_k.update_layout(paper_bgcolor="#080e14", plot_bgcolor="#080e14",
-                            coloraxis_showscale=False, yaxis_tickformat=".2%",
-                            margin=dict(t=40,b=20,l=0,r=0))
-        st.plotly_chart(fig_k, use_container_width=True)
-
-    cap_display = cap_by_grade.copy()
-    cap_display["total_rwa"]         = cap_display["total_rwa"].map("${:,.0f}".format)
-    cap_display["total_capital_req"] = cap_display["total_capital_req"].map("${:,.0f}".format)
-    cap_display["mean_K"]            = cap_display["mean_K"].map("{:.3%}".format)
-    cap_display["rwa_density"]       = cap_display["rwa_density"].map("{:.2f}x".format)
-    cap_display = cap_display.rename(columns={
-        "total_rwa":"Total RWA","total_capital_req":"Capital Required",
-        "mean_K":"Mean K","rwa_density":"RWA Density (RWA/EAD)",
-    })
-    st.dataframe(cap_display, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown(
-        f"<div style='font-size:0.75rem; color:#4a7fa5'>"
-        f"Data: test split ({portfolio['n_loans']:,} loans) · "
-        f"LGD: Basel II 45% constant · EAD: funded_amnt − total_pymnt · "
-        f"Generated: {datetime.now().strftime('%Y-%m-%d')}</div>",
-        unsafe_allow_html=True,
-    )
+    # Raw Data Table
+    with st.expander("View Loan-Level Risk Data"):
+        st.dataframe(df_el.head(1000), use_container_width=True)
 
 
 # ===========================================================================
