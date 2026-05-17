@@ -10,11 +10,14 @@ Bloomberg-style dark UI | Three pages:
 
 Run: streamlit run src/app.py
 
-FIXES v2:
+FIXES v3:
+  - Navigation labels now visible (was var(--muted), now var(--text) with accent on selected)
+  - prepare_portfolio accepts DataFrame directly, eliminating pickle serialisation round trip
+  - Portfolio prep stored in st.session_state so it runs exactly once per session
   - Vectorised Basel II capital formula (eliminates row-by-row .apply bottleneck)
   - @st.cache_data on portfolio prep (computes once per session, not per page switch)
   - WoE transform updated for v2 pipeline mapping format {rules, edges, is_numeric}
-  - pandas Styler.applymap → map compatibility shim
+  - pandas Styler.applymap -> map compatibility shim
 """
 
 import warnings
@@ -36,10 +39,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# ── Paths ──────────────────────────────────────────────────────────────────────
-SRC_DIR     = Path(__file__).resolve().parent
-OUTPUTS_DIR = SRC_DIR.parent / "scorecard_outputs"
 
 # ── Bloomberg-style CSS ────────────────────────────────────────────────────────
 st.markdown("""
@@ -131,8 +130,16 @@ html, body, [class*="css"] {
 }
 .stButton > button:hover { background: var(--accent) !important; color: var(--bg) !important; }
 
+/* FIX: navigation labels were var(--muted) — invisible on dark background */
 section[data-testid="stSidebar"] { background: var(--surface) !important; border-right: 1px solid var(--border) !important; }
-section[data-testid="stSidebar"] .stRadio label { font-family: var(--mono) !important; font-size: 12px !important; color: var(--muted) !important; }
+section[data-testid="stSidebar"] .stRadio label {
+    font-family: var(--mono) !important;
+    font-size: 12px !important;
+    color: var(--text) !important;
+}
+section[data-testid="stSidebar"] .stRadio label:has(input:checked) {
+    color: var(--accent) !important;
+}
 
 .stDataFrame { background: var(--surface) !important; }
 hr { border-color: var(--border) !important; }
@@ -201,6 +208,11 @@ def load_artifacts():
     return arts
 
 
+# ── Paths ──────────────────────────────────────────────────────────────────────
+SRC_DIR     = Path(__file__).resolve().parent
+OUTPUTS_DIR = SRC_DIR.parent / "scorecard_outputs"
+
+
 def align_features(model, feature_names: list) -> list:
     if model is None or feature_names is None:
         return feature_names or []
@@ -262,7 +274,7 @@ def get_band(score: int) -> tuple:
 
 
 def get_decision(score: int, cutoff: int = SA_APPROVAL) -> tuple:
-    if score >= cutoff + 15:  return "APPROVE", "approve"
+    if score >= cutoff + 15:   return "APPROVE", "approve"
     elif score >= cutoff - 10: return "REFER",   "refer"
     else:                      return "DECLINE",  "decline"
 
@@ -277,20 +289,15 @@ def compute_pd(model, woe_vec: np.ndarray) -> float:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BASEL II RWA — FULLY VECTORISED
-# FIX: replaced row-by-row .apply(lambda r: regulatory_capital(...)) with
-#      numpy array operations. scipy.norm is called once on entire arrays
-#      instead of once per row — ~100x faster on large portfolios.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def basel_correlation(pd_val: float) -> float:
-    """Scalar version for single-applicant inference page."""
-    e50   = np.exp(-50)
-    r1    = (1 - np.exp(-50 * pd_val)) / (1 - e50)
+    e50 = np.exp(-50)
+    r1  = (1 - np.exp(-50 * pd_val)) / (1 - e50)
     return 0.12 * r1 + 0.24 * (1 - r1)
 
 
 def regulatory_capital(pd_val: float, lgd: float, maturity: float = 2.5) -> float:
-    """Scalar version for single-applicant inference page."""
     if pd_val <= 0 or pd_val >= 1:
         return 0.0
     R   = basel_correlation(pd_val)
@@ -302,7 +309,6 @@ def regulatory_capital(pd_val: float, lgd: float, maturity: float = 2.5) -> floa
     return max(float(K), 0.0)
 
 
-# Vectorised equivalents — called once on the whole portfolio array
 def _basel_correlation_vec(pd_arr: np.ndarray) -> np.ndarray:
     r1 = (1 - np.exp(-50 * pd_arr)) / (1 - np.exp(-50))
     return 0.12 * r1 + 0.24 * (1 - r1)
@@ -313,10 +319,6 @@ def _regulatory_capital_vec(
     lgd_arr: np.ndarray,
     maturity: float = 2.5,
 ) -> np.ndarray:
-    """
-    Vectorised Basel II IRB capital formula.
-    All scipy/numpy calls operate on the full array in one pass.
-    """
     pd_arr  = np.clip(pd_arr,  1e-6, 1 - 1e-6)
     lgd_arr = np.clip(lgd_arr, 0.0,  1.0)
     R   = _basel_correlation_vec(pd_arr)
@@ -331,38 +333,30 @@ def _regulatory_capital_vec(
 
 
 def compute_rwa(pd_val: float, lgd: float, ead: float) -> dict:
-    K   = regulatory_capital(pd_val, lgd)
+    K = regulatory_capital(pd_val, lgd)
     return {"K": K, "RWA": K * ead * 12.5, "EL": pd_val * lgd * ead}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PORTFOLIO PREP — cached so it only runs once per session, not per page switch
-# FIX: wrapping the heavy dataframe computation in @st.cache_data means
-#      navigating away from Portfolio and back costs zero recomputation.
+# PORTFOLIO PREP
+# FIX: accepts DataFrame directly instead of serialised bytes, eliminating the
+#      pickle.dumps / pickle.loads round trip on every page render.
+#      Result is stored in st.session_state so it runs exactly once per session.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner="Preparing portfolio…")
-def prepare_portfolio(portfolio_bytes: bytes) -> pd.DataFrame:
-    """
-    Deserialise and enrich portfolio DataFrame.
-    Accepts serialised bytes so Streamlit can hash the input correctly.
-    All vectorised — no row-by-row .apply().
-    """
-    import io
-    df = pickle.loads(portfolio_bytes)
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
+def prepare_portfolio(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
     def _num(series, fallback):
         return pd.to_numeric(series, errors="coerce").fillna(fallback)
 
-    # Resolve columns flexibly
     def _resolve(*names, fallback):
         for n in names:
             if n in df.columns:
                 return _num(df[n], fallback)
-            low = n.lower()
+            low   = n.lower()
             match = next((c for c in df.columns if c.lower() == low), None)
             if match:
                 return _num(df[match], fallback)
@@ -372,28 +366,22 @@ def prepare_portfolio(portfolio_bytes: bytes) -> pd.DataFrame:
     df["_lgd"] = _resolve("lgd", "LGD", "loss_given_default",          fallback=0.45).clip(0, 1)
     df["_ead"] = _resolve("ead", "EAD", "funded_amnt", "loan_amnt",    fallback=10_000).clip(0)
 
-    # Vectorised capital (single scipy call for the whole column)
     K_vec       = _regulatory_capital_vec(df["_pd"].values, df["_lgd"].values)
     df["_K"]    = K_vec
     df["_RWA"]  = K_vec * df["_ead"].values * 12.5
     df["_el"]   = df["_pd"] * df["_lgd"] * df["_ead"]
 
-    # Stress: LGD + 200 bps
-    lgd_stress       = (df["_lgd"] + 0.02).clip(0, 1)
-    K_stress         = _regulatory_capital_vec(df["_pd"].values, lgd_stress.values)
-    df["_lgd_stress"]= lgd_stress
-    df["_RWA_stress"]= K_stress * df["_ead"].values * 12.5
-    df["_el_stress"] = df["_pd"] * lgd_stress * df["_ead"]
+    lgd_stress        = (df["_lgd"] + 0.02).clip(0, 1)
+    K_stress          = _regulatory_capital_vec(df["_pd"].values, lgd_stress.values)
+    df["_lgd_stress"] = lgd_stress
+    df["_RWA_stress"] = K_stress * df["_ead"].values * 12.5
+    df["_el_stress"]  = df["_pd"] * lgd_stress * df["_ead"]
 
     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WOE TRANSFORM — updated for v2 pipeline mapping format
-# FIX: v2 pipeline stores woe_mappings[col] = {"rules": {bin: woe}, "edges": [...],
-#      "is_numeric": bool, ...}.  The old code used the whole dict as the mapping
-#      and tried regex interval matching against integer bin labels — every lookup
-#      returned 0.0.  Now we read meta["rules"] and use np.digitize with meta["edges"].
+# WOE TRANSFORM
 # ══════════════════════════════════════════════════════════════════════════════
 
 def woe_transform_single(
@@ -401,11 +389,6 @@ def woe_transform_single(
     woe_mappings: dict,
     feature_names: list,
 ) -> np.ndarray:
-    """
-    Transform one applicant's raw values to a WoE feature vector.
-    Handles both v1 (flat dict / DataFrame) and v2 ({rules, edges, ...}) formats.
-    Unknown bins → WoE = 0.0 (population average, conservative).
-    """
     result = []
 
     for feat in feature_names:
@@ -416,30 +399,25 @@ def woe_transform_single(
 
         meta = woe_mappings[feat]
 
-        # ── v2 pipeline format ────────────────────────────────────────────────
         if isinstance(meta, dict) and "rules" in meta:
-            rules      = meta["rules"]                   # {bin_label: woe_value}
-            edges      = meta.get("edges")               # np.ndarray or None
+            rules      = meta["rules"]
+            edges      = meta.get("edges")
             is_numeric = meta.get("is_numeric", True)
 
             if is_numeric and edges is not None and isinstance(val, (int, float)) and not np.isnan(float(val)):
-                # Replicate the same np.digitize call used during training
                 bin_idx = int(np.digitize(float(val), edges[1:-1]))
                 woe_val = rules.get(str(bin_idx), rules.get(bin_idx, 0.0))
             else:
-                # Categorical or missing
                 woe_val = rules.get(str(val), rules.get(val, 0.0))
 
             result.append(float(woe_val) if woe_val is not None else 0.0)
             continue
 
-        # ── v1 pipeline format — DataFrame with bin/woe columns ──────────────
         if isinstance(meta, pd.DataFrame) and "bin" in meta.columns and "woe" in meta.columns:
             woe_map = dict(zip(meta["bin"].astype(str), meta["woe"]))
             result.append(float(woe_map.get(str(val), 0.0)))
             continue
 
-        # ── v1 pipeline format — flat dict ───────────────────────────────────
         if isinstance(meta, dict):
             result.append(float(meta.get(str(val), meta.get(val, 0.0))))
             continue
@@ -450,7 +428,7 @@ def woe_transform_single(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLOTLY HELPERS — Bloomberg dark style (unchanged)
+# PLOTLY HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 DARK_LAYOUT = dict(
@@ -656,11 +634,11 @@ def page_inference(arts: dict):
         "total_acc": total_acc, "term": term,
     }
 
-    woe_vec            = woe_transform_single(raw_vals, woe_maps, features)
-    pd_val             = compute_pd(model, woe_vec)
-    score              = score_from_pd(pd_val)
-    band, band_css     = get_band(score)
-    decision, dec_css  = get_decision(score, cutoff)
+    woe_vec           = woe_transform_single(raw_vals, woe_maps, features)
+    pd_val            = compute_pd(model, woe_vec)
+    score             = score_from_pd(pd_val)
+    band, band_css    = get_band(score)
+    decision, dec_css = get_decision(score, cutoff)
 
     grade   = sub_grade[0] if sub_grade else "C"
     lgd_map = lgd_mdl.get("lgd_by_grade", {}) if lgd_mdl else {}
@@ -691,13 +669,13 @@ def page_inference(arts: dict):
     with r3:
         metric_card("LGD", f"{lgd_val*100:.1f}%", f"Grade {grade}", "blue")
         st.markdown("<br>", unsafe_allow_html=True)
-        metric_card("Expected Loss", f"R{rwa_res['EL']:,.0f}", "PD × LGD × EAD",
+        metric_card("Expected Loss", f"R{rwa_res['EL']:,.0f}", "PD x LGD x EAD",
                     "warn" if rwa_res["EL"] > loan_amnt * 0.05 else "teal")
 
     with r4:
         metric_card("Reg. Capital (K)", f"{rwa_res['K']*100:.2f}%", "Basel II IRB formula", "blue")
         st.markdown("<br>", unsafe_allow_html=True)
-        metric_card("RWA", f"R{rwa_res['RWA']:,.0f}", "K × EAD × 12.5", "warn")
+        metric_card("RWA", f"R{rwa_res['RWA']:,.0f}", "K x EAD x 12.5", "warn")
 
     with r5:
         corr = basel_correlation(pd_val)
@@ -733,12 +711,12 @@ def page_inference(arts: dict):
             f'border-bottom:1px solid #252530;">'
             f'<span style="color:#6b6b80;font-size:11px">{f}</span>'
             f'<span style="color:{"#50fa7b" if w*c > 0 else "#ff5555"};font-size:11px">'
-            f'{w:.3f} × {c:.4f}</span></div>'
+            f'{w:.3f} x {c:.4f}</span></div>'
             for f, w, c in top_feats
         ])
         st.markdown(f"""
         <div class="metric-card">
-            <div class="metric-label">Top Feature Contributions (WOE × Coef)</div>
+            <div class="metric-label">Top Feature Contributions (WOE x Coef)</div>
             <div style="font-family:IBM Plex Mono;margin-top:8px;">{rows_html}</div>
         </div>""", unsafe_allow_html=True)
 
@@ -756,24 +734,27 @@ def page_portfolio(arts: dict):
         st.markdown("Place your `el_results.pkl` in `scorecard_outputs/` and restart.")
         return
 
-    # Serialise to bytes for cache-key hashing, then prepare once
-    raw_bytes = pickle.dumps(portfolio)
-    df = prepare_portfolio(raw_bytes)
+    # FIX: store prepared portfolio in session_state so prepare_portfolio
+    # runs exactly once per session regardless of how many times the user
+    # navigates to this page. Eliminates the pickle bytes round trip entirely.
+    if "prepared_portfolio" not in st.session_state:
+        st.session_state["prepared_portfolio"] = prepare_portfolio(portfolio)
+    df = st.session_state["prepared_portfolio"]
 
     stress_on = st.sidebar.toggle("🔴 Stress Test (LGD +200bps)", value=False)
 
     el_col  = "_el_stress"  if stress_on else "_el"
     rwa_col = "_RWA_stress" if stress_on else "_RWA"
 
-    total_ead   = df["_ead"].sum()
-    wa_pd       = (df["_pd"]  * df["_ead"]).sum() / max(total_ead, 1)
-    wa_lgd      = (df["_lgd"] * df["_ead"]).sum() / max(total_ead, 1)
-    total_el    = df[el_col].sum()
-    total_rwa   = df[rwa_col].sum()
-    baseline_el = df["_el"].sum()
-    baseline_rwa= df["_RWA"].sum()
-    el_delta    = total_el  - baseline_el
-    rwa_delta   = total_rwa - baseline_rwa
+    total_ead    = df["_ead"].sum()
+    wa_pd        = (df["_pd"]  * df["_ead"]).sum() / max(total_ead, 1)
+    wa_lgd       = (df["_lgd"] * df["_ead"]).sum() / max(total_ead, 1)
+    total_el     = df[el_col].sum()
+    total_rwa    = df[rwa_col].sum()
+    baseline_el  = df["_el"].sum()
+    baseline_rwa = df["_RWA"].sum()
+    el_delta     = total_el  - baseline_el
+    rwa_delta    = total_rwa - baseline_rwa
 
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     with k1:
@@ -836,7 +817,7 @@ def page_portfolio(arts: dict):
         </div>""", unsafe_allow_html=True)
 
     section("PORTFOLIO DETAIL (TOP 50)")
-    rename = {"_pd": "PD", "_lgd": "LGD", "_ead": "EAD", "_el": "EL", "_RWA": "RWA"}
+    rename   = {"_pd": "PD", "_lgd": "LGD", "_ead": "EAD", "_el": "EL", "_RWA": "RWA"}
     raw_cols = [c for c in df.columns if not c.startswith("_")]
     show_df  = df[raw_cols + ["_pd","_lgd","_ead","_el","_RWA"]].rename(columns=rename).head(50)
     st.dataframe(show_df, use_container_width=True, height=280)
@@ -915,7 +896,6 @@ def page_monitoring(arts: dict):
 
         styled = sweep_df.style.format(fmt)
         if "recall_bad" in sweep_df.columns:
-            # FIX: Styler.applymap was renamed to .map in pandas >= 2.1
             try:
                 styled = styled.map(_colour_recall, subset=["recall_bad"])
             except AttributeError:

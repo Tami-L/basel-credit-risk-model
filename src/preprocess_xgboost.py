@@ -3,22 +3,6 @@ preprocess_xgboost.py
 ---------------------
 Minimal preprocessing of raw loan data for XGBoost.
 
-Philosophy
-----------
-XGBoost does not need WOE encoding, binning, or monotonicity enforcement.
-It discovers non-linear patterns and interactions in raw data autonomously
-via tree splits. All we need to do is:
-
-  1. Remove post-origination columns (data leakage — same whitelist as woe_etl.py)
-  2. Encode string categoricals as integers (XGBoost cannot handle strings)
-  3. Leave all numeric columns as-is — including missing values, which XGBoost
-     handles natively by learning an optimal default split direction per feature
-  4. Align to the EXACT same train/test row split as the LR model so AUC
-     comparisons are on the same held-out observations
-
-No binning. No WOE. No feature selection. XGBoost will rank feature importance
-itself; weak features get zero splits and cause no harm.
-
 Run order
 ---------
     python src/woe_etl.py               
