@@ -130,15 +130,25 @@ html, body, [class*="css"] {
 }
 .stButton > button:hover { background: var(--accent) !important; color: var(--bg) !important; }
 
-/* FIX: navigation labels were var(--muted) — invisible on dark background */
 section[data-testid="stSidebar"] { background: var(--surface) !important; border-right: 1px solid var(--border) !important; }
-section[data-testid="stSidebar"] .stRadio label {
-    font-family: var(--mono) !important;
-    font-size: 12px !important;
+
+/* FIX: replaced radio with session_state buttons for persistent navigation */
+section[data-testid="stSidebar"] .stButton > button {
+    background: transparent !important;
+    border: none !important;
     color: var(--text) !important;
+    text-align: left !important;
+    padding: 6px 10px !important;
+    text-transform: none !important;
+    letter-spacing: 0.04em !important;
+    font-size: 13px !important;
+    width: 100% !important;
+    border-radius: 3px !important;
 }
-section[data-testid="stSidebar"] .stRadio label:has(input:checked) {
+section[data-testid="stSidebar"] .stButton > button:hover {
     color: var(--accent) !important;
+    background: rgba(0,212,170,0.06) !important;
+    border: none !important;
 }
 
 .stDataFrame { background: var(--surface) !important; }
@@ -853,34 +863,6 @@ def page_monitoring(arts: dict):
                         f"{'✓ PASS' if passed else '✗ FAIL'} ({'≥' if label != 'PSI' else '<'} {thresh})",
                         "good" if passed else "danger")
 
-    p_good = metrics.get("y_prob_test")
-    y_true = metrics.get("y_test")
-
-    ch1, ch2 = st.columns(2)
-
-    with ch1:
-        section("ROC CURVE")
-        if p_good is not None and y_true is not None:
-            from sklearn.metrics import roc_curve as _roc
-            fpr, tpr, _ = _roc(y_true, p_good)
-            st.plotly_chart(roc_chart(fpr, tpr, auc), use_container_width=True)
-        else:
-            st.info("ROC data not in model_metrics.pkl. Ensure evaluate.py saves y_prob_test and y_test.")
-
-    with ch2:
-        section("KS CHART")
-        if p_good is not None and y_true is not None:
-            ks_df = (
-                pd.DataFrame({"y": y_true, "p_good": p_good})
-                .sort_values("p_good", ascending=False)
-                .reset_index(drop=True)
-            )
-            ks_df["cum_good"] = (ks_df["y"] == 1).cumsum() / max((ks_df["y"] == 1).sum(), 1)
-            ks_df["cum_bad"]  = (ks_df["y"] == 0).cumsum() / max((ks_df["y"] == 0).sum(), 1)
-            st.plotly_chart(ks_chart(ks_df, ks), use_container_width=True)
-        else:
-            st.info("KS data not in model_metrics.pkl.")
-
     sweep = metrics.get("threshold_sweep", [])
     if sweep:
         section("THRESHOLD SWEEP — BAD LOAN DETECTION")
@@ -933,7 +915,16 @@ def main():
         st.markdown('<div style="font-family:IBM Plex Mono;font-size:10px;color:#6b6b80;'
                     'letter-spacing:0.12em;text-transform:uppercase;margin-bottom:12px;">Navigation</div>',
                     unsafe_allow_html=True)
-        page = st.radio("", ["Inference", "Portfolio", "Monitoring"], label_visibility="collapsed")
+        if "page" not in st.session_state:
+            st.session_state["page"] = "Inference"
+
+        for p in ["Inference", "Portfolio", "Monitoring"]:
+            active = st.session_state["page"] == p
+            label  = f"{'> ' if active else '  '}{p}"
+            if st.sidebar.button(label, key=f"nav_{p}", use_container_width=True):
+                st.session_state["page"] = p
+
+        page = st.session_state["page"]
         st.markdown("---")
 
         st.markdown('<div style="font-family:IBM Plex Mono;font-size:10px;color:#6b6b80;'
