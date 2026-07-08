@@ -187,8 +187,28 @@ hr { border-color: var(--border) !important; }
 .band-bad  { background: rgba(255,85,85,0.15);  color: #ff5555; border: 1px solid #ff555544; }
 
 .stToggle label { font-family: var(--mono) !important; font-size: 12px !important; }
-#MainMenu, footer, header { visibility: hidden; }
+
+/* FIX v5: hiding the whole `header` element (as before) also hides the
+   sidebar collapse/expand arrow, since that control lives inside the
+   header in current Streamlit versions. That's what made the sidebar
+   vanish with no way to reopen it. Now we only hide the hamburger menu,
+   footer, and Deploy button, and just make the header background
+   transparent so it blends into the dark theme instead of disappearing. */
+#MainMenu, footer { visibility: hidden; }
 .stDeployButton { display: none; }
+header[data-testid="stHeader"] {
+    background: transparent !important;
+    box-shadow: none !important;
+}
+header[data-testid="stHeader"] * {
+    visibility: visible !important;
+}
+button[data-testid="stBaseButton-headerNoPadding"],
+button[data-testid="collapsedControl"] {
+    color: var(--text) !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
