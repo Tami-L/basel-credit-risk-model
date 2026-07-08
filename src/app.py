@@ -18,6 +18,13 @@ FIXES v3:
   - @st.cache_data on portfolio prep (computes once per session, not per page switch)
   - WoE transform updated for v2 pipeline mapping format {rules, edges, is_numeric}
   - pandas Styler.applymap -> map compatibility shim
+
+FIXES v4:
+  - Sidebar navigation rewritten as st.sidebar.radio (was fragile per-page
+    button loop that could silently fail to switch pages depending on
+    Streamlit version / rerun timing)
+  - Default landing page changed to Monitoring
+  - All three pages remain fully reachable from the same radio control
 """
 
 import warnings
@@ -132,23 +139,36 @@ html, body, [class*="css"] {
 
 section[data-testid="stSidebar"] { background: var(--surface) !important; border-right: 1px solid var(--border) !important; }
 
-/* FIX: replaced radio with session_state buttons for persistent navigation */
-section[data-testid="stSidebar"] .stButton > button {
-    background: transparent !important;
-    border: none !important;
-    color: var(--text) !important;
-    text-align: left !important;
-    padding: 6px 10px !important;
-    text-transform: none !important;
-    letter-spacing: 0.04em !important;
-    font-size: 13px !important;
-    width: 100% !important;
-    border-radius: 3px !important;
+/* FIX v4: navigation is now a plain st.sidebar.radio, styled to match the
+   Bloomberg theme instead of the old per-page button loop. */
+section[data-testid="stSidebar"] .stRadio > label {
+    display: none !important; /* label_visibility="collapsed" already hides this, belt & braces */
 }
-section[data-testid="stSidebar"] .stButton > button:hover {
+section[data-testid="stSidebar"] .stRadio > div {
+    gap: 2px !important;
+}
+section[data-testid="stSidebar"] .stRadio > div > label {
+    background: transparent !important;
+    border: 1px solid transparent !important;
+    border-radius: 3px !important;
+    padding: 6px 10px !important;
+    margin: 0 !important;
+    width: 100% !important;
+    color: var(--text) !important;
+    font-family: var(--mono) !important;
+    font-size: 13px !important;
+    letter-spacing: 0.04em !important;
+    transition: all 0.15s !important;
+}
+section[data-testid="stSidebar"] .stRadio > div > label:hover {
     color: var(--accent) !important;
     background: rgba(0,212,170,0.06) !important;
-    border: none !important;
+}
+section[data-testid="stSidebar"] .stRadio > div > label[data-checked="true"],
+section[data-testid="stSidebar"] .stRadio > div > label:has(input:checked) {
+    color: var(--accent) !important;
+    border-color: var(--accent) !important;
+    background: rgba(0,212,170,0.08) !important;
 }
 
 .stDataFrame { background: var(--surface) !important; }
@@ -911,20 +931,32 @@ def main():
     header()
     arts = load_artifacts()
 
+    # FIX v4: page order now starts on Monitoring, and navigation is a plain
+    # st.sidebar.radio instead of a per-page st.button loop. The old approach
+    # kept its own session_state["page"] flag that a button click updated,
+    # but nothing forced Streamlit to re-render the *rest* of the sidebar in
+    # sync with it in every version/timing scenario, which is what made page
+    # switches feel like they "stuck" on Inference. A radio widget is bound
+    # directly to its own state and always reruns the script on selection.
+    PAGES = ["Monitoring", "Inference", "Portfolio"]
+
     with st.sidebar:
         st.markdown('<div style="font-family:IBM Plex Mono;font-size:10px;color:#6b6b80;'
                     'letter-spacing:0.12em;text-transform:uppercase;margin-bottom:12px;">Navigation</div>',
                     unsafe_allow_html=True)
-        if "page" not in st.session_state:
-            st.session_state["page"] = "Inference"
 
-        for p in ["Inference", "Portfolio", "Monitoring"]:
-            active = st.session_state["page"] == p
-            label  = f"{'> ' if active else '  '}{p}"
-            if st.sidebar.button(label, key=f"nav_{p}", use_container_width=True):
-                st.session_state["page"] = p
+        if "page" not in st.session_state or st.session_state["page"] not in PAGES:
+            st.session_state["page"] = PAGES[0]
 
-        page = st.session_state["page"]
+        page = st.sidebar.radio(
+            "Go to",
+            PAGES,
+            index=PAGES.index(st.session_state["page"]),
+            key="nav_radio",
+            label_visibility="collapsed",
+        )
+        st.session_state["page"] = page
+
         st.markdown("---")
 
         st.markdown('<div style="font-family:IBM Plex Mono;font-size:10px;color:#6b6b80;'
